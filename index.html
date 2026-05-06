@@ -8,27 +8,47 @@
     :root { color-scheme: light dark; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-      max-width: 42rem; margin: 4rem auto; padding: 0 1.25rem; line-height: 1.55;
+      max-width: 44rem; margin: 3rem auto 4rem; padding: 0 1.25rem; line-height: 1.55;
     }
-    h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+    h1 { font-size: 1.85rem; margin-bottom: 0.25rem; }
+    h2 { margin-top: 2.25rem; }
+    h3 { margin-top: 1.5rem; font-size: 1.05rem; }
     .lede { color: #555; margin-top: 0; }
     pre {
       background: #f4f4f5; border-radius: 6px; padding: 0.9rem 1rem;
       overflow-x: auto; font-size: 0.92rem;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    ul { padding-left: 1.25rem; }
+    li { margin: 0.25rem 0; }
+    .pill {
+      display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
+      background: #eef2ff; color: #3730a3; font-size: 0.78rem; font-weight: 600;
+      letter-spacing: 0.02em; vertical-align: middle;
     }
     @media (prefers-color-scheme: dark) {
       body { background: #0d1117; color: #e6edf3; }
       .lede { color: #8b949e; }
       pre { background: #161b22; }
       a { color: #58a6ff; }
+      .pill { background: #1f2937; color: #a5b4fc; }
     }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     footer { margin-top: 3rem; color: #888; font-size: 0.85rem; }
   </style>
 </head>
 <body>
-  <h1>VeeCode Claude Gateway</h1>
-  <p class="lede">Corporate gateway for Claude Code: Google identity in, attributable spend + audit logs out.</p>
+  <h1>VeeCode Claude Gateway <span class="pill">M2 pilot</span></h1>
+  <p class="lede">
+    Corporate gateway for Claude Code: Google identity in, attributable spend + audit logs out.
+    Routes <code>claude</code> through <code>https://claude-gateway.vee.codes</code>.
+  </p>
+
+  <h2>Prerequisites</h2>
+  <ul>
+    <li>A Google Workspace account on a permitted domain</li>
+    <li><a href="https://cloud.google.com/sdk/docs/install"><code>gcloud</code></a> installed and authenticated once: <code>gcloud auth login</code></li>
+    <li><a href="https://docs.claude.com/en/docs/claude-code">Claude Code</a> already installed (<code>npm i -g @anthropic-ai/claude-code</code>) — the installer locates it on <code>PATH</code>, it does not install it for you</li>
+  </ul>
 
   <h2>Install (macOS / Linux)</h2>
 <pre><code>curl -fsSL https://veecode-claude-gateway.github.io/install.sh | bash</code></pre>
@@ -36,13 +56,44 @@
   <h2>Install (Windows PowerShell 7+)</h2>
 <pre><code>iwr https://veecode-claude-gateway.github.io/install.ps1 | iex</code></pre>
 
-  <h2>What this does</h2>
+  <h2>What it does</h2>
   <p>
-    Installs a thin <code>claude</code> wrapper that turns your active <code>gcloud</code> identity
-    into a short-lived gateway virtual key, points Claude Code at the gateway, and execs the real
-    binary. The full developer onboarding doc lives in the
-    <a href="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/developer-setup.md">meta-repo</a>.
+    Drops a thin <code>claude</code> wrapper ahead of the real binary on <code>PATH</code>. On invocation
+    it exchanges your <code>gcloud</code> access token for a short-lived gateway virtual key (cached at
+    <code>~/.config/claude-gateway/key</code> for ~24h, mode 0600), points Claude Code at the gateway via
+    <code>ANTHROPIC_BASE_URL</code>, then <code>exec</code>s the real binary. You don't manage credentials.
   </p>
+  <p>The gateway logs <strong>metadata only</strong> — timestamp, model, token counts, your email. Conversation contents are not logged.</p>
+
+  <h2>Verify</h2>
+<pre><code>exec $SHELL    # or open a new terminal so PATH picks up the wrapper
+claude --version</code></pre>
+
+  <h2>Troubleshooting</h2>
+  <h3>"gcloud not found" / "print-access-token failed"</h3>
+  <p>Install the gcloud CLI and run <code>gcloud auth login</code>. The wrapper needs a live identity to mint a key.</p>
+  <h3>"could not reach gateway"</h3>
+  <p>Check VPN / network. The gateway is at <code>https://claude-gateway.vee.codes</code>.</p>
+  <h3>Auth errors after working previously</h3>
+  <p>The cached virtual key may have rotated. Force a refresh:</p>
+<pre><code>rm ~/.config/claude-gateway/key &amp;&amp; claude --version</code></pre>
+  <h3>Switching gateways (advanced)</h3>
+<pre><code>export CLAUDE_GATEWAY_URL=https://your-other-gateway.example
+curl -fsSL https://veecode-claude-gateway.github.io/install.sh | bash</code></pre>
+
+  <h2>Reporting issues</h2>
+  <p>
+    File a GitHub issue at
+    <a href="https://github.com/veecode-claude-gateway/claude-gateway-parent/issues">claude-gateway-parent/issues</a>.
+    Include the output of <code>claude --version</code> and a one-line description of what you were doing.
+  </p>
+
+  <h2>Read more</h2>
+  <ul>
+    <li><a href="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/developer-setup.md">Developer setup</a> — full onboarding doc</li>
+    <li><a href="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/architecture.md">Architecture</a></li>
+    <li><a href="https://github.com/veecode-claude-gateway/claude-gateway-parent/tree/main/docs/runbooks">Runbooks</a></li>
+  </ul>
 
   <footer>
     Source: <a href="https://github.com/veecode-claude-gateway/veecode-claude-gateway.github.io">veecode-claude-gateway.github.io</a>.

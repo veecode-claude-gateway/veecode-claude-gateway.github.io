@@ -3,7 +3,7 @@
 # https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/developer-setup.md
 $ErrorActionPreference = 'Stop'
 
-$GatewayUrl     = if ($env:CLAUDE_GATEWAY_URL)         { $env:CLAUDE_GATEWAY_URL }         else { 'https://gateway.example.com' }
+$GatewayUrl     = if ($env:CLAUDE_GATEWAY_URL)         { $env:CLAUDE_GATEWAY_URL }         else { 'https://claude-gateway.vee.codes' }
 $WrapperVersion = if ($env:CLAUDE_GATEWAY_VERSION)     { $env:CLAUDE_GATEWAY_VERSION }     else { 'dev' }
 $InstallDir     = if ($env:CLAUDE_GATEWAY_INSTALL_DIR) { $env:CLAUDE_GATEWAY_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'claude-gateway\bin' }
 $WrapperUrl     = if ($env:CLAUDE_GATEWAY_WRAPPER_URL) { $env:CLAUDE_GATEWAY_WRAPPER_URL } else { 'https://veecode-claude-gateway.github.io/claude.ps1' }
@@ -64,7 +64,7 @@ try {
     Log "verify ok: '$shim --version' returned 0"
 } catch {
     Log "warning: '$shim --version' did not return 0 ($($_.Exception.Message))"
-    Log "  this is expected if CLAUDE_GATEWAY_URL is the placeholder or 'gcloud auth login' has not been run yet"
-    Log "  re-run after: `$env:CLAUDE_GATEWAY_URL = '<real gateway>'; gcloud auth login"
+    Log "  most often this means 'gcloud auth login' has not been run yet — run it and try again"
+    Log "  override the gateway with: `$env:CLAUDE_GATEWAY_URL = '<url>' (default: $GatewayUrl)"
 }
 Log "done. Open a new shell so the PATH change takes effect, then run 'claude'."

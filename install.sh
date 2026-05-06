@@ -4,7 +4,7 @@
 # https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/developer-setup.md
 set -euo pipefail
 
-GATEWAY_URL="${CLAUDE_GATEWAY_URL:-https://gateway.example.com}"
+GATEWAY_URL="${CLAUDE_GATEWAY_URL:-https://claude-gateway.vee.codes}"
 WRAPPER_VERSION="${CLAUDE_GATEWAY_VERSION:-dev}"
 INSTALL_DIR="${CLAUDE_GATEWAY_INSTALL_DIR:-$HOME/.claude-gateway/bin}"
 INSTALL_PATH="$INSTALL_DIR/claude"
@@ -95,8 +95,8 @@ if "$INSTALL_PATH" --version >/dev/null 2>&1; then
   log "verify ok: '$INSTALL_PATH --version' returned 0"
 else
   log "warning: '$INSTALL_PATH --version' did not return 0"
-  log "  this is expected if CLAUDE_GATEWAY_URL is the placeholder or 'gcloud auth login' has not been run yet"
-  log "  re-run after: export CLAUDE_GATEWAY_URL=<real gateway> && gcloud auth login"
+  log "  most often this means 'gcloud auth login' has not been run yet — run it and try again"
+  log "  override the gateway with: export CLAUDE_GATEWAY_URL=<url> (default: $GATEWAY_URL)"
 fi
 
 log "done. Open a new shell (or 'exec \$SHELL') so the PATH change takes effect, then run 'claude'."
