@@ -34,10 +34,25 @@ fi
 if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt 3600 ]; then
   command -v gcloud >/dev/null 2>&1 || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
   token=$(gcloud auth print-access-token 2>/dev/null) || die "'gcloud auth print-access-token' failed. Run 'gcloud auth login'."
-  resp=$(curl -fsS --max-time 10 -X POST "$GATEWAY_URL/issue-key" \
+  # Capture status + body separately. Without -f, curl returns 0 on any
+  # HTTP response, so a non-zero exit here is a real network/DNS/TLS
+  # failure. Application-layer errors (4xx/5xx from the gateway) get
+  # their own branches below — conflating them with "could not reach"
+  # sent pilots chasing imaginary VPN/proxy issues on day 1.
+  tmp=$(mktemp -t claude-gateway.XXXXXX) || die "mktemp failed"
+  http_code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 -X POST "$GATEWAY_URL/issue-key" \
       -H "Authorization: Bearer $token" \
-      -H "Content-Type: application/json" -d '{}') \
-    || die "could not reach gateway at $GATEWAY_URL. See ${RUNBOOK_URL}."
+      -H "Content-Type: application/json" -d '{}') || {
+    rm -f "$tmp"
+    die "could not reach gateway at $GATEWAY_URL (network/DNS/TLS failure). See ${RUNBOOK_URL}."
+  }
+  resp=$(cat "$tmp"); rm -f "$tmp"
+  case "$http_code" in
+    2*) : ;;
+    401|403) die "gateway rejected your identity ($http_code): $resp. Run 'gcloud auth login' if your token has expired." ;;
+    5*)      die "gateway error $http_code from /issue-key: $resp. See ${RUNBOOK_URL}." ;;
+    *)       die "unexpected gateway response $http_code: $resp" ;;
+  esac
   # Tiny inline JSON parse — avoids a jq dependency.
   key=$(printf '%s' "$resp" | sed -n 's/.*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   exp_iso=$(printf '%s' "$resp" | sed -n 's/.*"expires_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')

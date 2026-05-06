@@ -36,7 +36,29 @@ if (-not $key -or ($expiresAt - [DateTime]::UtcNow).TotalSeconds -lt 3600) {
             -Headers @{ Authorization = "Bearer $token" } `
             -ContentType 'application/json' -Body '{}' -TimeoutSec 10
     } catch {
-        Die "could not reach gateway at $GatewayUrl ($($_.Exception.Message)). See $Runbook."
+        # Distinguish a real network/DNS/TLS failure from a 4xx/5xx so
+        # pilots don't go chasing imaginary VPN issues when the gateway
+        # is reachable but unhappy. .Exception.Response is null on
+        # network errors and populated for HTTP error responses on both
+        # PS 5.1 (WebException) and PS 7+ (HttpResponseException).
+        $statusCode = $null
+        $body = $null
+        if ($_.Exception.Response) {
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                $body = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
+            } catch {}
+        }
+        if (-not $statusCode) {
+            Die "could not reach gateway at $GatewayUrl (network/DNS/TLS failure: $($_.Exception.Message)). See $Runbook."
+        } elseif ($statusCode -eq 401 -or $statusCode -eq 403) {
+            Die "gateway rejected your identity ($statusCode): $body. Run 'gcloud auth login' if your token has expired."
+        } elseif ($statusCode -ge 500) {
+            Die "gateway error $statusCode from /issue-key: $body. See $Runbook."
+        } else {
+            Die "unexpected gateway response $statusCode: $body"
+        }
     }
     $key = $resp.key
     if (-not $key) { Die "gateway response missing 'key'." }
