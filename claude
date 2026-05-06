@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# VeeCode Claude Gateway wrapper — see meta-repo docs/developer-setup.md.
+# Routes Claude Code through the corporate gateway, attributing spend to the
+# active gcloud identity. This file shadows the real `claude` binary; install.sh
+# substitutes the @@-delimited placeholders below.
+set -eu
+
+GATEWAY_URL="@@GATEWAY_URL@@"
+REAL_CLAUDE="@@REAL_CLAUDE@@"
+WRAPPER_VERSION="@@WRAPPER_VERSION@@"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
+KEY_FILE="$CONFIG_DIR/key"
+RUNBOOK_URL="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/runbooks/"
+
+die() { printf 'claude-gateway: %s\n' "$*" >&2; exit 1; }
+
+mkdir -p "$CONFIG_DIR"
+
+now=$(date -u +%s)
+key=""; expires_at_epoch=0
+if [ -r "$KEY_FILE" ]; then
+  # File format: two lines — key, then expires_at ISO8601.
+  key=$(sed -n '1p' "$KEY_FILE" 2>/dev/null || true)
+  exp_iso=$(sed -n '2p' "$KEY_FILE" 2>/dev/null || true)
+  if [ -n "${exp_iso:-}" ]; then
+    # GNU date and BSD date disagree on flags; try both.
+    expires_at_epoch=$(date -u -d "$exp_iso" +%s 2>/dev/null \
+      || date -u -j -f '%Y-%m-%dT%H:%M:%S%z' "${exp_iso%.*}" +%s 2>/dev/null \
+      || echo 0)
+  fi
+fi
+
+if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt 3600 ]; then
+  command -v gcloud >/dev/null 2>&1 || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
+  token=$(gcloud auth print-access-token 2>/dev/null) || die "'gcloud auth print-access-token' failed. Run 'gcloud auth login'."
+  resp=$(curl -fsS --max-time 10 -X POST "$GATEWAY_URL/issue-key" \
+      -H "Authorization: Bearer $token" \
+      -H "Content-Type: application/json" -d '{}') \
+    || die "could not reach gateway at $GATEWAY_URL. See ${RUNBOOK_URL}."
+  # Tiny inline JSON parse — avoids a jq dependency.
+  key=$(printf '%s' "$resp" | sed -n 's/.*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  exp_iso=$(printf '%s' "$resp" | sed -n 's/.*"expires_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -n "$key" ] || die "gateway response missing 'key': $resp"
+  umask 077
+  printf '%s\n%s\n' "$key" "$exp_iso" > "$KEY_FILE"
+  chmod 600 "$KEY_FILE"
+fi
+
+export ANTHROPIC_BASE_URL="$GATEWAY_URL"
+export ANTHROPIC_API_KEY="$key"
+export CLAUDE_CONFIG_DIR="$CONFIG_DIR/claude"
+export ANTHROPIC_DEFAULT_HEADERS="x-claude-gateway-cli: $WRAPPER_VERSION"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+
+exec "$REAL_CLAUDE" "$@"

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VeeCode Claude Gateway</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 42rem; margin: 4rem auto; padding: 0 1.25rem; line-height: 1.55;
+    }
+    h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+    .lede { color: #555; margin-top: 0; }
+    pre {
+      background: #f4f4f5; border-radius: 6px; padding: 0.9rem 1rem;
+      overflow-x: auto; font-size: 0.92rem;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0d1117; color: #e6edf3; }
+      .lede { color: #8b949e; }
+      pre { background: #161b22; }
+      a { color: #58a6ff; }
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    footer { margin-top: 3rem; color: #888; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>VeeCode Claude Gateway</h1>
+  <p class="lede">Corporate gateway for Claude Code: Google identity in, attributable spend + audit logs out.</p>
+
+  <h2>Install (macOS / Linux)</h2>
+<pre><code>curl -fsSL https://veecode-claude-gateway.github.io/install.sh | bash</code></pre>
+
+  <h2>Install (Windows PowerShell 7+)</h2>
+<pre><code>iwr https://veecode-claude-gateway.github.io/install.ps1 | iex</code></pre>
+
+  <h2>What this does</h2>
+  <p>
+    Installs a thin <code>claude</code> wrapper that turns your active <code>gcloud</code> identity
+    into a short-lived gateway virtual key, points Claude Code at the gateway, and execs the real
+    binary. The full developer onboarding doc lives in the
+    <a href="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/developer-setup.md">meta-repo</a>.
+  </p>
+
+  <footer>
+    Source: <a href="https://github.com/veecode-claude-gateway/veecode-claude-gateway.github.io">veecode-claude-gateway.github.io</a>.
+    Architecture: <a href="https://github.com/veecode-claude-gateway/claude-gateway-parent">claude-gateway-parent</a>.
+  </footer>
+</body>
+</html>
