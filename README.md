@@ -10,8 +10,8 @@ This is the org-default GitHub Pages site (`https://veecode-claude-gateway.githu
 |------|---------|
 | `claude` | POSIX wrapper template — substituted at install time. |
 | `claude.ps1` | PowerShell wrapper template (Windows). |
-| `install.sh` | macOS / Linux installer one-liner target. |
-| `install.ps1` | Windows installer one-liner target. |
+| `install.sh` | macOS / Linux installer one-liner target. Per-user install, no sudo. |
+| `install.ps1` | Windows installer one-liner target. Per-user install, no admin. |
 | `index.html` | Public landing page. |
 
 ## Install

@@ -1,5 +1,5 @@
 # VeeCode Claude Gateway — installer for the `claude` wrapper (Windows).
-# Idempotent: re-running upgrades the wrapper in place. See
+# Per-user install (no admin). Re-running upgrades the wrapper in place. See
 # https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/developer-setup.md
 $ErrorActionPreference = 'Stop'
 
@@ -58,11 +58,13 @@ if (-not ($userPath -split ';' | Where-Object { $_ -ieq $InstallDir })) {
     Log "added $InstallDir to user PATH (open a new shell to pick it up)"
 }
 
-# 5) Verify (using the freshly installed shim path).
+# 5) Verify by absolute path (does not depend on PATH being re-read).
 try {
     & $shim --version | Out-Null
-    Log "verify ok: 'claude --version' returned 0"
+    Log "verify ok: '$shim --version' returned 0"
 } catch {
-    Die "verify failed: $($_.Exception.Message)"
+    Log "warning: '$shim --version' did not return 0 ($($_.Exception.Message))"
+    Log "  this is expected if CLAUDE_GATEWAY_URL is the placeholder or 'gcloud auth login' has not been run yet"
+    Log "  re-run after: `$env:CLAUDE_GATEWAY_URL = '<real gateway>'; gcloud auth login"
 }
-Log "done. Run 'claude' in a new shell to start a gateway-routed session."
+Log "done. Open a new shell so the PATH change takes effect, then run 'claude'."
