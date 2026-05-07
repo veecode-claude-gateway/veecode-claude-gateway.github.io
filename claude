@@ -119,34 +119,45 @@ maybe_self_update() {
   # Bump unconditionally so a Pages outage cannot cause hammering.
   printf '%s\n' "$now" > "$LAST_CHECK_FILE"
 
-  local latest latest_hash
-  latest=$(curl -fsSL --max-time 5 "$WRAPPER_URL" 2>/dev/null) || return 0
-  [ -n "$latest" ] || return 0
-  case "$latest" in
-    '#!/usr/bin/env bash'*|'#!/bin/bash'*) : ;;
-    *) return 0 ;;
+  # Download straight to a tempfile — using `latest=$(curl ...)` would
+  # silently strip trailing newlines (command-substitution behaviour),
+  # leaving the saved file 1 byte short of what Pages serves and making
+  # every subsequent hash compare fail. The result was a wrapper that
+  # "updated" every 24h forever even when Pages didn't change.
+  local tmpfile latest_hash first_line poison_re
+  tmpfile=$(mktemp -t claude-gateway-update.XXXXXX) || return 0
+  if ! curl -fsSL --max-time 5 -o "$tmpfile" "$WRAPPER_URL" 2>/dev/null; then
+    rm -f "$tmpfile"
+    return 0
+  fi
+  [ -s "$tmpfile" ] || { rm -f "$tmpfile"; return 0; }
+
+  first_line=$(head -n 1 "$tmpfile")
+  case "$first_line" in
+    '#!/usr/bin/env bash'|'#!/bin/bash') : ;;
+    *) rm -f "$tmpfile"; return 0 ;;
   esac
+
   # Refuse to install a template that still has the pre-refactor
   # install-time at-at placeholders. Defense against accidentally
   # downgrading if Pages temporarily serves stale content. Pattern is
   # assembled via concat so this source file doesn't itself contain
   # the literal token (which would self-DoS the guard the moment it
   # runs against a fresh copy of itself).
-  local poison_re
   poison_re='@@''(GATEWAY_URL|REAL_CLAUDE|WRAPPER_VERSION)''@@'
-  if printf '%s' "$latest" | grep -qE "$poison_re"; then
+  if grep -qE "$poison_re" "$tmpfile"; then
+    rm -f "$tmpfile"
     return 0
   fi
 
-  latest_hash=$(printf '%s' "$latest" | sha256_stdin) || return 0
-  [ "$latest_hash" != "$SELF_HASH" ] || return 0
-
-  local tmpfile
-  tmpfile=$(mktemp -t claude-gateway-update.XXXXXX) || return 0
-  printf '%s' "$latest" > "$tmpfile"
-  chmod 755 "$tmpfile"
+  latest_hash=$(sha256_file "$tmpfile") || { rm -f "$tmpfile"; return 0; }
+  if [ "$latest_hash" = "$SELF_HASH" ]; then
+    rm -f "$tmpfile"
+    return 0
+  fi
 
   cp "$INSTALL_PATH" "$INSTALL_PATH.prev" 2>/dev/null || true
+  chmod 755 "$tmpfile"
   if ! mv "$tmpfile" "$INSTALL_PATH" 2>/dev/null; then
     rm -f "$tmpfile"
     return 0
