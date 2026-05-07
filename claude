@@ -1,27 +1,32 @@
 #!/usr/bin/env bash
 # VeeCode Claude Gateway wrapper — see meta-repo docs/developer-setup.md.
 # Routes Claude Code through the corporate gateway, attributing spend to the
-# active gcloud identity. This file shadows the real `claude` binary; install.sh
-# substitutes the @@-delimited placeholders below.
+# active gcloud identity. This file shadows the real `claude` binary.
 #
-# v0.4: self-updating, with a small visible banner. Update cadence matches
-# the issued-key TTL (24h) so steady-state cost is one curl/day. Failures
-# are fail-open — a Pages outage cannot brick `claude`. See
-# claude-gateway-parent/CHANGELOG.md for the full design.
+# Self-resolving (no install-time templating): GATEWAY_URL comes from
+# ~/.config/claude-gateway/config (bootstrapped on first run);
+# REAL_CLAUDE is found at runtime by walking PATH; WRAPPER_VERSION is
+# derived from the script's own sha256 so it's always content-accurate.
+# What Pages serves is exactly what runs — no rendering step.
+#
+# Self-updating: once per UPDATE_CADENCE_S (24h, matching key TTL), curl
+# Pages, sha256-compare to self, atomic-replace + re-exec on mismatch.
+# Cache invalidation cascades: a wrapper-content change invalidates the
+# cached virtual key (key_meta carries the wrapper's self-hash). Failures
+# are fail-open — a Pages outage cannot brick `claude`.
 set -eu
 
-GATEWAY_URL="@@GATEWAY_URL@@"
-REAL_CLAUDE="@@REAL_CLAUDE@@"
-WRAPPER_VERSION="@@WRAPPER_VERSION@@"
-
-WRAPPER_URL="https://veecode-claude-gateway.github.io/claude"
-INSTALL_PATH="$HOME/.claude-gateway/bin/claude"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
+CONFIG_FILE="$CONFIG_DIR/config"
 KEY_FILE="$CONFIG_DIR/key"
 KEY_META="$CONFIG_DIR/key_meta"
-TEMPLATE_HASH_FILE="$CONFIG_DIR/template_hash"
 LAST_CHECK_FILE="$CONFIG_DIR/last_check"
+
+INSTALL_PATH="$HOME/.claude-gateway/bin/claude"
+WRAPPER_URL="https://veecode-claude-gateway.github.io/claude"
+DEFAULT_GATEWAY_URL="https://claude-gateway.vee.codes"
 RUNBOOK_URL="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/runbooks/"
+
 UPDATE_CADENCE_S=$((24 * 60 * 60))
 KEY_REFRESH_THRESHOLD_S=3600
 
@@ -30,27 +35,22 @@ mkdir -p "$CONFIG_DIR"
 die() { printf 'claude-gateway: %s\n' "$*" >&2; exit 1; }
 quiet() { [ -n "${CLAUDE_GATEWAY_QUIET:-}" ]; }
 
-# ---- ANSI colors (only when stderr is a TTY and NO_COLOR is not set) ----
+# ---- ANSI (only when stderr is a TTY and NO_COLOR isn't set) ----------
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
-  C_BOLD_CYAN=$'\033[1;36m'
-  C_DIM=$'\033[2m'
-  C_RESET=$'\033[0m'
+  C_BOLD_CYAN=$'\033[1;36m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
 else
   C_BOLD_CYAN=""; C_DIM=""; C_RESET=""
 fi
 
 # ---- portable sha256 (BSD shasum on macOS, GNU sha256sum on Linux) ----
 sha256_stdin() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 | cut -d' ' -f1
-  else
-    return 1
-  fi
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+  else return 1; fi
 }
+sha256_file() { sha256_stdin < "$1"; }
 
-# ---- portable iso8601 → epoch ----
+# ---- portable iso8601 → epoch -----------------------------------------
 # /issue-key returns timestamps like "2026-05-08T13:00:54.258016+00:00".
 # GNU date eats them directly. BSD date (macOS default) needs:
 #   - fractional seconds removed (its %S has no fractional part)
@@ -64,15 +64,48 @@ iso_to_epoch() {
   date -u -j -f '%Y-%m-%dT%H:%M:%S%z' "$norm" +%s 2>/dev/null || echo 0
 }
 
-# ---- self-update (cadenced, fail-open) ---------------------------------
-# Every UPDATE_CADENCE_S seconds, fetch the Pages template, hash it,
-# compare against TEMPLATE_HASH_FILE. If different → render placeholders,
-# atomic-replace, re-exec. The cached key is NOT invalidated here — it
-# falls out automatically when the new wrapper sees key_meta != template
-# hash (next block).
-#
-# Always bump LAST_CHECK_FILE, even on failure, so a Pages outage cannot
-# cause hammering. Skip entirely when CLAUDE_GATEWAY_NO_UPDATE is set.
+# ---- config: source if present, else bootstrap with default -----------
+# The config file is plain `KEY="value"` lines, sourced as bash. Mode
+# 600 by convention. Owner-managed: edit to override the gateway URL.
+GATEWAY_URL="$DEFAULT_GATEWAY_URL"
+if [ -r "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+else
+  umask 077
+  printf 'GATEWAY_URL="%s"\n' "$GATEWAY_URL" > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+fi
+
+# ---- self-hash + wrapper version (content-derived) --------------------
+SELF_HASH=$(sha256_file "$0" 2>/dev/null || echo "")
+WRAPPER_VERSION="${SELF_HASH:0:7}"
+[ -n "$WRAPPER_VERSION" ] || WRAPPER_VERSION="unknown"
+
+# ---- resolve REAL_CLAUDE at runtime -----------------------------------
+# Walk PATH, skip the wrapper's own install path, skip any other instance
+# of the wrapper (identified by a marker in its header). This is the
+# same logic install.sh uses, just lifted into the wrapper itself so
+# there's no install-time bake-in.
+resolve_real_claude() {
+  local IFS=:
+  local d candidate
+  for d in $PATH; do
+    [ -n "$d" ] || continue
+    candidate="$d/claude"
+    [ -x "$candidate" ] || continue
+    [ "$candidate" = "$INSTALL_PATH" ] && continue
+    head -n 5 "$candidate" 2>/dev/null | grep -q 'VeeCode Claude Gateway wrapper' && continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# ---- self-update (cadenced, fail-open) --------------------------------
+# Compare sha256(self) vs sha256(latest from Pages). On mismatch,
+# atomic-replace and re-exec. The downloaded script runs verbatim — no
+# templating step here, no substitution-in-source bug class.
 maybe_self_update() {
   [ -z "${CLAUDE_GATEWAY_NO_UPDATE:-}" ] || return 0
 
@@ -83,69 +116,56 @@ maybe_self_update() {
   delta=$((now - last))
   [ "$delta" -ge "$UPDATE_CADENCE_S" ] || return 0
 
+  # Bump unconditionally so a Pages outage cannot cause hammering.
   printf '%s\n' "$now" > "$LAST_CHECK_FILE"
 
-  local latest tmpl_hash current_hash
+  local latest latest_hash
   latest=$(curl -fsSL --max-time 5 "$WRAPPER_URL" 2>/dev/null) || return 0
   [ -n "$latest" ] || return 0
-  # Refuse to install anything that doesn't smell like a bash script.
   case "$latest" in
     '#!/usr/bin/env bash'*|'#!/bin/bash'*) : ;;
     *) return 0 ;;
   esac
+  # Refuse to install a template that still has the pre-refactor
+  # install-time at-at placeholders. Defense against accidentally
+  # downgrading if Pages temporarily serves stale content. Pattern is
+  # assembled via concat so this source file doesn't itself contain
+  # the literal token (which would self-DoS the guard the moment it
+  # runs against a fresh copy of itself).
+  local poison_re
+  poison_re='@@''(GATEWAY_URL|REAL_CLAUDE|WRAPPER_VERSION)''@@'
+  if printf '%s' "$latest" | grep -qE "$poison_re"; then
+    return 0
+  fi
 
-  tmpl_hash=$(printf '%s' "$latest" | sha256_stdin) || return 0
-  current_hash=$(cat "$TEMPLATE_HASH_FILE" 2>/dev/null || echo "")
-  [ "$tmpl_hash" != "$current_hash" ] || return 0
+  latest_hash=$(printf '%s' "$latest" | sha256_stdin) || return 0
+  [ "$latest_hash" != "$SELF_HASH" ] || return 0
 
-  # Render placeholders. WRAPPER_VERSION becomes a content-derived stamp
-  # so the banner shows something meaningful even without a tagged release.
-  #
-  # The string-concat trick below is load-bearing. install.sh runs a
-  # blanket `sed s|<MARKER>|<value>|g` against the entire wrapper at
-  # install time (where <MARKER> is the at-at-delimited placeholder).
-  # Any literal placeholder text in *this* function body would itself
-  # be rewritten, turning the substitution patterns into matches on the
-  # placeholder's *value* (e.g., `dev`) — which then replaces every
-  # `dev` everywhere (incl. `/dev/null`) in the next-fetched template.
-  # Bash assembles the adjacent string literals at parse time, but
-  # install.sh's sed only sees three separate quoted segments per line
-  # and leaves them alone. Don't write the at-at placeholder literally
-  # anywhere in this file outside the variable assignments at the top.
-  local new_version rendered tmpfile p_gw p_real p_ver
-  new_version="v$(date -u +%Y%m%d)-${tmpl_hash:0:7}"
-  p_gw='@@'"GATEWAY_URL"'@@'
-  p_real='@@'"REAL_CLAUDE"'@@'
-  p_ver='@@'"WRAPPER_VERSION"'@@'
-  rendered=$(printf '%s' "$latest" \
-    | sed "s|$p_gw|$GATEWAY_URL|g" \
-    | sed "s|$p_real|$REAL_CLAUDE|g" \
-    | sed "s|$p_ver|$new_version|g")
-
+  local tmpfile
   tmpfile=$(mktemp -t claude-gateway-update.XXXXXX) || return 0
-  printf '%s' "$rendered" > "$tmpfile"
+  printf '%s' "$latest" > "$tmpfile"
   chmod 755 "$tmpfile"
 
-  # Keep one-deep backup at $INSTALL_PATH.prev for manual rollback.
   cp "$INSTALL_PATH" "$INSTALL_PATH.prev" 2>/dev/null || true
-
   if ! mv "$tmpfile" "$INSTALL_PATH" 2>/dev/null; then
     rm -f "$tmpfile"
     return 0
   fi
-  printf '%s\n' "$tmpl_hash" > "$TEMPLATE_HASH_FILE"
 
   if ! quiet && [ -t 2 ]; then
-    printf '%s· wrapper updated to %s%s\n' "$C_DIM" "$new_version" "$C_RESET" >&2
+    printf '%s· wrapper updated (%s → %s)%s\n' \
+      "$C_DIM" "${SELF_HASH:0:7}" "${latest_hash:0:7}" "$C_RESET" >&2
   fi
 
-  # Re-exec self with the original args. The new wrapper picks up here.
   exec "$0" "$@"
 }
 
 maybe_self_update "$@"
 
-# ---- key-cache load ----------------------------------------------------
+REAL_CLAUDE=$(resolve_real_claude) \
+  || die "could not find a real 'claude' binary on PATH (excluding the wrapper). Install Claude Code: https://docs.claude.com/en/docs/claude-code"
+
+# ---- key-cache load ---------------------------------------------------
 now=$(date -u +%s)
 key=""; expires_at_epoch=0; exp_iso=""
 if [ -r "$KEY_FILE" ]; then
@@ -154,20 +174,18 @@ if [ -r "$KEY_FILE" ]; then
   [ -n "${exp_iso:-}" ] && expires_at_epoch=$(iso_to_epoch "$exp_iso")
 fi
 
-# ---- invalidate cached key if minted under a different wrapper template
-# Cheap, deterministic invalidation: when the wrapper template changes
+# ---- invalidate cached key if minted under a different wrapper --------
+# Cheap, deterministic invalidation: when this script's content changes
 # (manual re-install OR self-update above), the cached key may have been
 # minted under assumptions the new code doesn't share (env-var rename,
 # header rename, etc.). Re-mint instead of using a key the new code
-# wouldn't have produced. Fixes the "wrapper upgraded, cached key now
-# unusable" failure mode that the M2 pilot ran into post-rename.
-template_hash=$(cat "$TEMPLATE_HASH_FILE" 2>/dev/null || echo "")
+# wouldn't have produced.
 key_meta=$(cat "$KEY_META" 2>/dev/null || echo "")
-if [ -n "$template_hash" ] && [ -n "$key_meta" ] && [ "$key_meta" != "$template_hash" ]; then
+if [ -n "$SELF_HASH" ] && [ -n "$key_meta" ] && [ "$key_meta" != "$SELF_HASH" ]; then
   key=""
 fi
 
-# ---- mint or refresh ---------------------------------------------------
+# ---- mint or refresh --------------------------------------------------
 if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt "$KEY_REFRESH_THRESHOLD_S" ]; then
   command -v gcloud >/dev/null 2>&1 \
     || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
@@ -194,16 +212,11 @@ if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt "$KEY_REFRESH_THRESHOLD_
   umask 077
   printf '%s\n%s\n' "$key" "$exp_iso" > "$KEY_FILE"
   chmod 600 "$KEY_FILE"
-  # Stamp this key with the current template hash so later invocations
-  # know which wrapper minted it. Empty when state is uninitialized
-  # (e.g. very first run on a host that pre-dates the self-update logic);
-  # not stamping in that case is fine — `key_meta != template_hash`
-  # invalidation only triggers when both are non-empty.
-  [ -n "$template_hash" ] && printf '%s\n' "$template_hash" > "$KEY_META"
+  [ -n "$SELF_HASH" ] && printf '%s\n' "$SELF_HASH" > "$KEY_META"
   expires_at_epoch=$(iso_to_epoch "$exp_iso")
 fi
 
-# ---- banner (stderr only, ≤2 lines, suppressible) ----------------------
+# ---- banner (stderr only, ≤2 lines, suppressible) ---------------------
 # Always-on by design: pilot users routinely forget they're routed
 # through a gateway, then mis-attribute weird behaviour to Anthropic.
 # Set CLAUDE_GATEWAY_QUIET=1 to suppress.
@@ -212,25 +225,18 @@ if [ -t 2 ] && ! quiet; then
   [ -n "$identity" ] || identity="(no gcloud account)"
 
   secs_left=$((expires_at_epoch - now))
-  if [ "$secs_left" -le 0 ]; then
-    key_state="expired"
-  elif [ "$secs_left" -ge 3600 ]; then
-    key_state="$((secs_left / 3600))h left"
-  else
-    key_state="$((secs_left / 60))m left"
+  if [ "$secs_left" -le 0 ]; then key_state="expired"
+  elif [ "$secs_left" -ge 3600 ]; then key_state="$((secs_left / 3600))h left"
+  else key_state="$((secs_left / 60))m left"
   fi
 
   last=$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo 0)
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
   since=$((now - last))
-  if [ "$last" -eq 0 ]; then
-    checked="never"
-  elif [ "$since" -ge 3600 ]; then
-    checked="$((since / 3600))h ago"
-  elif [ "$since" -ge 60 ]; then
-    checked="$((since / 60))m ago"
-  else
-    checked="just now"
+  if [ "$last" -eq 0 ]; then checked="never"
+  elif [ "$since" -ge 3600 ]; then checked="$((since / 3600))h ago"
+  elif [ "$since" -ge 60 ]; then checked="$((since / 60))m ago"
+  else checked="just now"
   fi
 
   gw_host=${GATEWAY_URL#http*://}
@@ -239,7 +245,7 @@ if [ -t 2 ] && ! quiet; then
     "$C_DIM" "$key_state" "$WRAPPER_VERSION" "$checked" "$gw_host" "$C_RESET" >&2
 fi
 
-# ---- exec the real claude ----------------------------------------------
+# ---- exec the real claude ---------------------------------------------
 export ANTHROPIC_BASE_URL="$GATEWAY_URL"
 export ANTHROPIC_AUTH_TOKEN="$key"
 unset ANTHROPIC_API_KEY

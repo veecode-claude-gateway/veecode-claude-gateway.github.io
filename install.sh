@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # VeeCode Claude Gateway — installer for the `claude` wrapper (macOS / Linux).
-# Per-user install, no sudo. Re-running upgrades the wrapper in place. See
-# https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/developer-setup.md
+# Per-user install, no sudo. Re-running upgrades the wrapper in place.
+#
+# The wrapper resolves its config (gateway URL) and the real `claude`
+# binary at runtime, so this installer does no templating: it downloads
+# the script verbatim, writes a small config file, and prepends the
+# install dir to PATH. What Pages serves is exactly what runs.
 set -euo pipefail
 
 GATEWAY_URL="${CLAUDE_GATEWAY_URL:-https://claude-gateway.vee.codes}"
-WRAPPER_VERSION="${CLAUDE_GATEWAY_VERSION:-dev}"
 INSTALL_DIR="${CLAUDE_GATEWAY_INSTALL_DIR:-$HOME/.claude-gateway/bin}"
 INSTALL_PATH="$INSTALL_DIR/claude"
 WRAPPER_URL="${CLAUDE_GATEWAY_WRAPPER_URL:-https://veecode-claude-gateway.github.io/claude}"
@@ -16,8 +19,10 @@ PATH_BLOCK_END='# <<< veecode-claude-gateway <<<'
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 log() { printf 'install: %s\n' "$*"; }
 
-# 1) Locate the real `claude` binary, ignoring our own install path and any
-# previously-installed wrapper (identified by a marker in its header comment).
+# 1) Sanity-check that a real `claude` exists on PATH (the wrapper will
+# locate it at runtime; failing fast here is friendlier than waiting
+# for the first invocation to error). Skip our own install path and any
+# existing wrapper (identified by a header marker).
 real_claude=""
 IFS=':' read -ra parts <<<"$PATH"
 for d in "${parts[@]}"; do
@@ -33,27 +38,35 @@ done
 [ -n "$real_claude" ] || die "couldn't find real 'claude' on PATH. Install Claude Code first: https://docs.claude.com/en/docs/claude-code"
 log "real claude binary: $real_claude"
 
-# 2) Fetch the wrapper template (or use a local copy if present alongside this script).
+# 2) Fetch the wrapper. Prefer a sibling file alongside this installer
+# (so a repo checkout exercises local edits); fall back to Pages.
 script_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)
-if [ -n "${script_dir:-}" ] && [ -f "$script_dir/claude" ]; then
-  template=$(cat "$script_dir/claude")
-else
-  template=$(curl -fsSL "$WRAPPER_URL") || die "could not download wrapper from $WRAPPER_URL"
-fi
-
-# 3) Substitute placeholders.
-rendered=$(printf '%s' "$template" \
-  | sed "s|@@GATEWAY_URL@@|$GATEWAY_URL|g" \
-  | sed "s|@@REAL_CLAUDE@@|$real_claude|g" \
-  | sed "s|@@WRAPPER_VERSION@@|$WRAPPER_VERSION|g")
-
-# 4) Install — per-user, no sudo.
 mkdir -p "$INSTALL_DIR"
-printf '%s' "$rendered" > "$INSTALL_PATH"
+if [ -n "${script_dir:-}" ] && [ -f "$script_dir/claude" ]; then
+  cp "$script_dir/claude" "$INSTALL_PATH"
+else
+  curl -fsSL "$WRAPPER_URL" -o "$INSTALL_PATH" \
+    || die "could not download wrapper from $WRAPPER_URL"
+fi
 chmod 755 "$INSTALL_PATH"
 log "installed wrapper to $INSTALL_PATH"
 
-# 5) Wire $INSTALL_DIR onto PATH in the user's shell rc files (idempotent).
+# 3) Write the config file the wrapper sources at startup. Owner-managed
+# afterward — edit to override the gateway URL without re-installing.
+gw_state_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
+mkdir -p "$gw_state_dir"
+umask 077
+printf 'GATEWAY_URL="%s"\n' "$GATEWAY_URL" > "$gw_state_dir/config"
+chmod 600 "$gw_state_dir/config"
+log "wrote config $gw_state_dir/config (GATEWAY_URL=$GATEWAY_URL)"
+
+# Seed last_check so the freshly-installed wrapper waits a full cadence
+# (24h) before its first self-update check. Without this, the wrapper's
+# very first invocation would run a no-op update against identical
+# content (harmless but wasteful + noisy in the banner).
+date -u +%s > "$gw_state_dir/last_check"
+
+# 4) Wire $INSTALL_DIR onto PATH in the user's shell rc files (idempotent).
 ensure_path_block() {
   local rc="$1"
   [ -f "$rc" ] || return 0
@@ -77,35 +90,18 @@ for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
   fi
 done
 if [ "$touched_rc" -eq 0 ]; then
-  # No rc found; create ~/.profile so login shells pick it up.
   ensure_path_block "$HOME/.profile" || true
   touch "$HOME/.profile"
   ensure_path_block "$HOME/.profile"
 fi
 
-# Make $INSTALL_DIR visible to this same shell so the verify step finds it.
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) : ;;
   *) export PATH="$INSTALL_DIR:$PATH" ;;
 esac
 
-# 6) Seed self-update state so the freshly-installed wrapper doesn't
-# trigger an immediate update check on first invocation. The wrapper
-# fetches the template from the same Pages URL we just installed from
-# and compares the SHA-256 — by recording that hash here, a fresh
-# install starts the 24h cadence from `now`. Best-effort: if shasum
-# isn't available, the wrapper's first run will simply self-update with
-# identical content, which is harmless. (M2 self-update spec.)
-gw_state_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
-mkdir -p "$gw_state_dir"
-if command -v shasum >/dev/null 2>&1; then
-  printf '%s' "$template" | shasum -a 256 | cut -d' ' -f1 > "$gw_state_dir/template_hash"
-elif command -v sha256sum >/dev/null 2>&1; then
-  printf '%s' "$template" | sha256sum | cut -d' ' -f1 > "$gw_state_dir/template_hash"
-fi
-date -u +%s > "$gw_state_dir/last_check"
-
-# 7) Verify by absolute path (does not depend on the rc edit being sourced).
+# 5) Verify by absolute path (does not depend on the rc edit being sourced).
+mkdir -p "$gw_state_dir/claude"
 if "$INSTALL_PATH" --version >/dev/null 2>&1; then
   log "verify ok: '$INSTALL_PATH --version' returned 0"
 else
