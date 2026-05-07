@@ -65,9 +65,16 @@ if (-not $key -or ($expiresAt - [DateTime]::UtcNow).TotalSeconds -lt 3600) {
     Set-Content -Path $KeyFile -Value @($key, $resp.expires_at) -NoNewline:$false
 }
 
-$env:ANTHROPIC_BASE_URL        = $GatewayUrl
-$env:ANTHROPIC_API_KEY         = $key
-$env:CLAUDE_CONFIG_DIR         = (Join-Path $ConfigDir 'claude')
+$env:ANTHROPIC_BASE_URL       = $GatewayUrl
+# Bearer auth, not x-api-key. The gateway's custom_auth.py reads only
+# the Authorization header; with ANTHROPIC_API_KEY set Claude Code
+# sends `x-api-key: <vk>` and every /v1/messages 401s. POSIX wrapper
+# was fixed in 174c656; this is the parity fix for Windows. Remove
+# any pre-existing ANTHROPIC_API_KEY in the parent env so it doesn't
+# override the auth-token path Claude Code falls back through.
+$env:ANTHROPIC_AUTH_TOKEN     = $key
+Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+$env:CLAUDE_CONFIG_DIR        = (Join-Path $ConfigDir 'claude')
 $env:ANTHROPIC_CUSTOM_HEADERS = "x-claude-gateway-cli: $WrapperVersion"
 New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
 
