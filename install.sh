@@ -89,8 +89,23 @@ case ":$PATH:" in
   *) export PATH="$INSTALL_DIR:$PATH" ;;
 esac
 
-# 6) Verify by absolute path (does not depend on the rc edit being sourced).
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
+# 6) Seed self-update state so the freshly-installed wrapper doesn't
+# trigger an immediate update check on first invocation. The wrapper
+# fetches the template from the same Pages URL we just installed from
+# and compares the SHA-256 — by recording that hash here, a fresh
+# install starts the 24h cadence from `now`. Best-effort: if shasum
+# isn't available, the wrapper's first run will simply self-update with
+# identical content, which is harmless. (M2 self-update spec.)
+gw_state_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
+mkdir -p "$gw_state_dir"
+if command -v shasum >/dev/null 2>&1; then
+  printf '%s' "$template" | shasum -a 256 | cut -d' ' -f1 > "$gw_state_dir/template_hash"
+elif command -v sha256sum >/dev/null 2>&1; then
+  printf '%s' "$template" | sha256sum | cut -d' ' -f1 > "$gw_state_dir/template_hash"
+fi
+date -u +%s > "$gw_state_dir/last_check"
+
+# 7) Verify by absolute path (does not depend on the rc edit being sourced).
 if "$INSTALL_PATH" --version >/dev/null 2>&1; then
   log "verify ok: '$INSTALL_PATH --version' returned 0"
 else

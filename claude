@@ -3,44 +3,179 @@
 # Routes Claude Code through the corporate gateway, attributing spend to the
 # active gcloud identity. This file shadows the real `claude` binary; install.sh
 # substitutes the @@-delimited placeholders below.
+#
+# v0.4: self-updating, with a small visible banner. Update cadence matches
+# the issued-key TTL (24h) so steady-state cost is one curl/day. Failures
+# are fail-open — a Pages outage cannot brick `claude`. See
+# claude-gateway-parent/CHANGELOG.md for the full design.
 set -eu
 
 GATEWAY_URL="@@GATEWAY_URL@@"
 REAL_CLAUDE="@@REAL_CLAUDE@@"
 WRAPPER_VERSION="@@WRAPPER_VERSION@@"
 
+WRAPPER_URL="https://veecode-claude-gateway.github.io/claude"
+INSTALL_PATH="$HOME/.claude-gateway/bin/claude"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
 KEY_FILE="$CONFIG_DIR/key"
+KEY_META="$CONFIG_DIR/key_meta"
+TEMPLATE_HASH_FILE="$CONFIG_DIR/template_hash"
+LAST_CHECK_FILE="$CONFIG_DIR/last_check"
 RUNBOOK_URL="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/runbooks/"
-
-die() { printf 'claude-gateway: %s\n' "$*" >&2; exit 1; }
+UPDATE_CADENCE_S=$((24 * 60 * 60))
+KEY_REFRESH_THRESHOLD_S=3600
 
 mkdir -p "$CONFIG_DIR"
 
-now=$(date -u +%s)
-key=""; expires_at_epoch=0
-if [ -r "$KEY_FILE" ]; then
-  # File format: two lines — key, then expires_at ISO8601.
-  key=$(sed -n '1p' "$KEY_FILE" 2>/dev/null || true)
-  exp_iso=$(sed -n '2p' "$KEY_FILE" 2>/dev/null || true)
-  if [ -n "${exp_iso:-}" ]; then
-    # GNU date and BSD date disagree on flags; try both.
-    expires_at_epoch=$(date -u -d "$exp_iso" +%s 2>/dev/null \
-      || date -u -j -f '%Y-%m-%dT%H:%M:%S%z' "${exp_iso%.*}" +%s 2>/dev/null \
-      || echo 0)
-  fi
+die() { printf 'claude-gateway: %s\n' "$*" >&2; exit 1; }
+quiet() { [ -n "${CLAUDE_GATEWAY_QUIET:-}" ]; }
+
+# ---- ANSI colors (only when stderr is a TTY and NO_COLOR is not set) ----
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_BOLD_CYAN=$'\033[1;36m'
+  C_DIM=$'\033[2m'
+  C_RESET=$'\033[0m'
+else
+  C_BOLD_CYAN=""; C_DIM=""; C_RESET=""
 fi
 
-if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt 3600 ]; then
-  command -v gcloud >/dev/null 2>&1 || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
-  token=$(gcloud auth print-access-token 2>/dev/null) || die "'gcloud auth print-access-token' failed. Run 'gcloud auth login'."
-  # Capture status + body separately. Without -f, curl returns 0 on any
-  # HTTP response, so a non-zero exit here is a real network/DNS/TLS
-  # failure. Application-layer errors (4xx/5xx from the gateway) get
-  # their own branches below — conflating them with "could not reach"
-  # sent pilots chasing imaginary VPN/proxy issues on day 1.
+# ---- portable sha256 (BSD shasum on macOS, GNU sha256sum on Linux) ----
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
+# ---- portable iso8601 → epoch ----
+# /issue-key returns timestamps like "2026-05-08T13:00:54.258016+00:00".
+# GNU date eats them directly. BSD date (macOS default) needs:
+#   - fractional seconds removed (its %S has no fractional part)
+#   - offset re-formatted from `+HH:MM` to `+HHMM` (its %z is +HHMM)
+# Without the normalization, BSD date silently fails and we fall to 0,
+# which makes the banner say "key expired" on a fresh key.
+iso_to_epoch() {
+  date -u -d "$1" +%s 2>/dev/null && return
+  local norm
+  norm=$(printf '%s' "$1" | sed -E 's/\.[0-9]+//; s/([+-])([0-9]{2}):([0-9]{2})$/\1\2\3/')
+  date -u -j -f '%Y-%m-%dT%H:%M:%S%z' "$norm" +%s 2>/dev/null || echo 0
+}
+
+# ---- self-update (cadenced, fail-open) ---------------------------------
+# Every UPDATE_CADENCE_S seconds, fetch the Pages template, hash it,
+# compare against TEMPLATE_HASH_FILE. If different → render placeholders,
+# atomic-replace, re-exec. The cached key is NOT invalidated here — it
+# falls out automatically when the new wrapper sees key_meta != template
+# hash (next block).
+#
+# Always bump LAST_CHECK_FILE, even on failure, so a Pages outage cannot
+# cause hammering. Skip entirely when CLAUDE_GATEWAY_NO_UPDATE is set.
+maybe_self_update() {
+  [ -z "${CLAUDE_GATEWAY_NO_UPDATE:-}" ] || return 0
+
+  local now last delta
+  now=$(date -u +%s)
+  last=$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  delta=$((now - last))
+  [ "$delta" -ge "$UPDATE_CADENCE_S" ] || return 0
+
+  printf '%s\n' "$now" > "$LAST_CHECK_FILE"
+
+  local latest tmpl_hash current_hash
+  latest=$(curl -fsSL --max-time 5 "$WRAPPER_URL" 2>/dev/null) || return 0
+  [ -n "$latest" ] || return 0
+  # Refuse to install anything that doesn't smell like a bash script.
+  case "$latest" in
+    '#!/usr/bin/env bash'*|'#!/bin/bash'*) : ;;
+    *) return 0 ;;
+  esac
+
+  tmpl_hash=$(printf '%s' "$latest" | sha256_stdin) || return 0
+  current_hash=$(cat "$TEMPLATE_HASH_FILE" 2>/dev/null || echo "")
+  [ "$tmpl_hash" != "$current_hash" ] || return 0
+
+  # Render placeholders. WRAPPER_VERSION becomes a content-derived stamp
+  # so the banner shows something meaningful even without a tagged release.
+  #
+  # The string-concat trick below is load-bearing. install.sh runs a
+  # blanket `sed s|<MARKER>|<value>|g` against the entire wrapper at
+  # install time (where <MARKER> is the at-at-delimited placeholder).
+  # Any literal placeholder text in *this* function body would itself
+  # be rewritten, turning the substitution patterns into matches on the
+  # placeholder's *value* (e.g., `dev`) — which then replaces every
+  # `dev` everywhere (incl. `/dev/null`) in the next-fetched template.
+  # Bash assembles the adjacent string literals at parse time, but
+  # install.sh's sed only sees three separate quoted segments per line
+  # and leaves them alone. Don't write the at-at placeholder literally
+  # anywhere in this file outside the variable assignments at the top.
+  local new_version rendered tmpfile p_gw p_real p_ver
+  new_version="v$(date -u +%Y%m%d)-${tmpl_hash:0:7}"
+  p_gw='@@'"GATEWAY_URL"'@@'
+  p_real='@@'"REAL_CLAUDE"'@@'
+  p_ver='@@'"WRAPPER_VERSION"'@@'
+  rendered=$(printf '%s' "$latest" \
+    | sed "s|$p_gw|$GATEWAY_URL|g" \
+    | sed "s|$p_real|$REAL_CLAUDE|g" \
+    | sed "s|$p_ver|$new_version|g")
+
+  tmpfile=$(mktemp -t claude-gateway-update.XXXXXX) || return 0
+  printf '%s' "$rendered" > "$tmpfile"
+  chmod 755 "$tmpfile"
+
+  # Keep one-deep backup at $INSTALL_PATH.prev for manual rollback.
+  cp "$INSTALL_PATH" "$INSTALL_PATH.prev" 2>/dev/null || true
+
+  if ! mv "$tmpfile" "$INSTALL_PATH" 2>/dev/null; then
+    rm -f "$tmpfile"
+    return 0
+  fi
+  printf '%s\n' "$tmpl_hash" > "$TEMPLATE_HASH_FILE"
+
+  if ! quiet && [ -t 2 ]; then
+    printf '%s· wrapper updated to %s%s\n' "$C_DIM" "$new_version" "$C_RESET" >&2
+  fi
+
+  # Re-exec self with the original args. The new wrapper picks up here.
+  exec "$0" "$@"
+}
+
+maybe_self_update "$@"
+
+# ---- key-cache load ----------------------------------------------------
+now=$(date -u +%s)
+key=""; expires_at_epoch=0; exp_iso=""
+if [ -r "$KEY_FILE" ]; then
+  key=$(sed -n '1p' "$KEY_FILE" 2>/dev/null || true)
+  exp_iso=$(sed -n '2p' "$KEY_FILE" 2>/dev/null || true)
+  [ -n "${exp_iso:-}" ] && expires_at_epoch=$(iso_to_epoch "$exp_iso")
+fi
+
+# ---- invalidate cached key if minted under a different wrapper template
+# Cheap, deterministic invalidation: when the wrapper template changes
+# (manual re-install OR self-update above), the cached key may have been
+# minted under assumptions the new code doesn't share (env-var rename,
+# header rename, etc.). Re-mint instead of using a key the new code
+# wouldn't have produced. Fixes the "wrapper upgraded, cached key now
+# unusable" failure mode that the M2 pilot ran into post-rename.
+template_hash=$(cat "$TEMPLATE_HASH_FILE" 2>/dev/null || echo "")
+key_meta=$(cat "$KEY_META" 2>/dev/null || echo "")
+if [ -n "$template_hash" ] && [ -n "$key_meta" ] && [ "$key_meta" != "$template_hash" ]; then
+  key=""
+fi
+
+# ---- mint or refresh ---------------------------------------------------
+if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt "$KEY_REFRESH_THRESHOLD_S" ]; then
+  command -v gcloud >/dev/null 2>&1 \
+    || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
+  token=$(gcloud auth print-access-token 2>/dev/null) \
+    || die "'gcloud auth print-access-token' failed. Run 'gcloud auth login'."
   tmp=$(mktemp -t claude-gateway.XXXXXX) || die "mktemp failed"
-  http_code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 -X POST "$GATEWAY_URL/issue-key" \
+  http_code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 \
+      -X POST "$GATEWAY_URL/issue-key" \
       -H "Authorization: Bearer $token" \
       -H "Content-Type: application/json" -d '{}') || {
     rm -f "$tmp"
@@ -53,15 +188,58 @@ if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt 3600 ]; then
     5*)      die "gateway error $http_code from /issue-key: $resp. See ${RUNBOOK_URL}." ;;
     *)       die "unexpected gateway response $http_code: $resp" ;;
   esac
-  # Tiny inline JSON parse — avoids a jq dependency.
   key=$(printf '%s' "$resp" | sed -n 's/.*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   exp_iso=$(printf '%s' "$resp" | sed -n 's/.*"expires_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   [ -n "$key" ] || die "gateway response missing 'key': $resp"
   umask 077
   printf '%s\n%s\n' "$key" "$exp_iso" > "$KEY_FILE"
   chmod 600 "$KEY_FILE"
+  # Stamp this key with the current template hash so later invocations
+  # know which wrapper minted it. Empty when state is uninitialized
+  # (e.g. very first run on a host that pre-dates the self-update logic);
+  # not stamping in that case is fine — `key_meta != template_hash`
+  # invalidation only triggers when both are non-empty.
+  [ -n "$template_hash" ] && printf '%s\n' "$template_hash" > "$KEY_META"
+  expires_at_epoch=$(iso_to_epoch "$exp_iso")
 fi
 
+# ---- banner (stderr only, ≤2 lines, suppressible) ----------------------
+# Always-on by design: pilot users routinely forget they're routed
+# through a gateway, then mis-attribute weird behaviour to Anthropic.
+# Set CLAUDE_GATEWAY_QUIET=1 to suppress.
+if [ -t 2 ] && ! quiet; then
+  identity=$(gcloud config get-value account 2>/dev/null | head -1 || true)
+  [ -n "$identity" ] || identity="(no gcloud account)"
+
+  secs_left=$((expires_at_epoch - now))
+  if [ "$secs_left" -le 0 ]; then
+    key_state="expired"
+  elif [ "$secs_left" -ge 3600 ]; then
+    key_state="$((secs_left / 3600))h left"
+  else
+    key_state="$((secs_left / 60))m left"
+  fi
+
+  last=$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  since=$((now - last))
+  if [ "$last" -eq 0 ]; then
+    checked="never"
+  elif [ "$since" -ge 3600 ]; then
+    checked="$((since / 3600))h ago"
+  elif [ "$since" -ge 60 ]; then
+    checked="$((since / 60))m ago"
+  else
+    checked="just now"
+  fi
+
+  gw_host=${GATEWAY_URL#http*://}
+  printf '%s▰ Claude Gateway%s · %s\n' "$C_BOLD_CYAN" "$C_RESET" "$identity" >&2
+  printf '%s  key %s · wrapper %s (checked %s) · via %s%s\n' \
+    "$C_DIM" "$key_state" "$WRAPPER_VERSION" "$checked" "$gw_host" "$C_RESET" >&2
+fi
+
+# ---- exec the real claude ----------------------------------------------
 export ANTHROPIC_BASE_URL="$GATEWAY_URL"
 export ANTHROPIC_AUTH_TOKEN="$key"
 unset ANTHROPIC_API_KEY
