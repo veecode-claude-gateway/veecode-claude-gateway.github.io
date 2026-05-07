@@ -1,0 +1,5 @@
+# Jekyll config for GitHub Pages.
+# Files listed here are not copied to the published site.
+exclude:
+  - CLAUDE.md
+  - README.md
