@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# VeeCode Claude Gateway — repo-owner CLI for CI virtual keys.
+# Mints / rotates / revokes / inspects long-lived virtual keys scoped
+# to a single GitHub repo, with spend rolling up to that repo (not to
+# the human creator). See M2/task-14 and ADR-0008 in claude-gateway-parent.
+#
+# Routes call the gateway endpoints introduced by litellm-gateway:
+#   POST /issue-ci-key   — mint a new key for a fresh (owner/repo) bucket
+#   POST /rotate-ci-key  — replace the live key, preserving team budget + spend
+#   POST /revoke-ci-key  — invalidate all keys on the repo's bucket
+#   GET  /ci-key-status  — show last4, expiry, spend, creator, etc.
+#
+# Auth model: every call exchanges a fresh `gcloud auth print-access-token`
+# for the gateway's identity check. There is no local key cache — these
+# are control-plane calls, not the data path. Pilot is small enough that
+# the once-per-call token cost is negligible. (Compare with `claude`
+# wrapper, which caches a virtual key for ~24h because it's on the
+# request hot path.)
+#
+# Install: `curl -fsSL https://veecode-claude-gateway.github.io/install-claude-gateway.sh | bash`
+# coexists with the `claude` wrapper installer; both drop into
+# `~/.claude-gateway/bin/`.
+set -eu
+
+GATEWAY_URL="@@GATEWAY_URL@@"
+CLI_VERSION="@@CLI_VERSION@@"
+RUNBOOK_URL="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/ci-keys.md"
+
+die() { printf 'claude-gateway: %s\n' "$*" >&2; exit 1; }
+log() { printf 'claude-gateway: %s\n' "$*"; }
+
+usage() {
+  cat <<EOF
+claude-gateway $CLI_VERSION — manage CI virtual keys for the VeeCode Claude Gateway.
+
+Usage:
+  claude-gateway issue-ci-key   --repo owner/name [--budget USD] [--ttl Nd]
+  claude-gateway rotate-ci-key  --repo owner/name
+  claude-gateway revoke-ci-key  --repo owner/name
+  claude-gateway ci-key-status  --repo owner/name
+  claude-gateway --version
+
+Options:
+  --repo owner/name    GitHub repo the key is scoped to. Required.
+  --budget USD         Monthly USD budget for the repo. issue-ci-key only.
+  --ttl Nd             TTL like "30d" or "90d". issue-ci-key only.
+  -h, --help           Show this help.
+
+Environment:
+  CLAUDE_GATEWAY_URL   Override the default gateway URL.
+
+Read the docs: $RUNBOOK_URL
+EOF
+}
+
+# ---- arg parsing -----------------------------------------------------
+
+cmd="${1:-}"
+case "$cmd" in
+  -h|--help|"") usage; exit 0 ;;
+  --version)    printf '%s\n' "$CLI_VERSION"; exit 0 ;;
+  issue-ci-key|rotate-ci-key|revoke-ci-key|ci-key-status) shift ;;
+  *) die "unknown subcommand '$cmd' — try 'claude-gateway --help'" ;;
+esac
+
+repo=""; budget=""; ttl=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)   repo="${2:-}";   shift 2 ;;
+    --budget) budget="${2:-}"; shift 2 ;;
+    --ttl)    ttl="${2:-}";    shift 2 ;;
+    *) die "unknown flag '$1'" ;;
+  esac
+done
+
+[ -n "$repo" ] || die "--repo owner/name is required"
+case "$repo" in
+  */*) : ;;
+  *)   die "--repo must be of the form 'owner/name'" ;;
+esac
+
+# Strip trailing 'd' from --ttl 30d → 30. The gateway's API takes integer days.
+ttl_days=""
+if [ -n "$ttl" ]; then
+  case "$ttl" in
+    *d) ttl_days="${ttl%d}" ;;
+    *)  ttl_days="$ttl" ;;
+  esac
+  case "$ttl_days" in
+    ''|*[!0-9]*) die "--ttl must be like '30d' or '30'" ;;
+  esac
+fi
+
+if [ -n "$budget" ]; then
+  case "$budget" in
+    ''|*[!0-9.]*) die "--budget must be a number (USD)" ;;
+  esac
+fi
+
+# Issue/rotate require positive numbers when caller supplies them; revoke and
+# status take only --repo. We don't reject extras for other commands — they're
+# silently ignored — to keep the parser simple.
+case "$cmd" in
+  rotate-ci-key|revoke-ci-key|ci-key-status)
+    [ -z "$budget" ] || die "--budget only valid for issue-ci-key"
+    [ -z "$ttl" ]    || die "--ttl only valid for issue-ci-key"
+    ;;
+esac
+
+# ---- gateway URL override -------------------------------------------
+
+GATEWAY_URL="${CLAUDE_GATEWAY_URL:-$GATEWAY_URL}"
+
+# ---- gcloud token ----------------------------------------------------
+
+command -v gcloud >/dev/null 2>&1 \
+  || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
+token=$(gcloud auth print-access-token 2>/dev/null) \
+  || die "'gcloud auth print-access-token' failed. Run 'gcloud auth login'."
+
+# ---- HTTP helper -----------------------------------------------------
+# Same error-classification invariant as the `claude` wrapper:
+# network/DNS/TLS != auth (401/403) != gateway 5xx. Pilots chased
+# imaginary VPN issues when these were conflated.
+
+http_call() {
+  method="$1"; path="$2"; body="${3:-}"
+  tmp=$(mktemp -t claude-gateway.XXXXXX) || die "mktemp failed"
+  if [ -n "$body" ]; then
+    http_code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 15 \
+      -X "$method" "$GATEWAY_URL$path" \
+      -H "Authorization: Bearer $token" \
+      -H "Content-Type: application/json" \
+      -d "$body") || {
+      rm -f "$tmp"
+      die "could not reach gateway at $GATEWAY_URL (network/DNS/TLS failure). See ${RUNBOOK_URL}."
+    }
+  else
+    http_code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 15 \
+      -X "$method" "$GATEWAY_URL$path" \
+      -H "Authorization: Bearer $token") || {
+      rm -f "$tmp"
+      die "could not reach gateway at $GATEWAY_URL (network/DNS/TLS failure). See ${RUNBOOK_URL}."
+    }
+  fi
+  resp_body=$(cat "$tmp"); rm -f "$tmp"
+  case "$http_code" in
+    2*) printf '%s' "$resp_body" ;;
+    401|403) die "gateway rejected your identity ($http_code): $resp_body. Run 'gcloud auth login' if your token has expired." ;;
+    409)     die "$resp_body" ;;
+    4*)      die "gateway rejected request ($http_code): $resp_body" ;;
+    5*)      die "gateway error $http_code: $resp_body. See ${RUNBOOK_URL}." ;;
+    *)       die "unexpected gateway response $http_code: $resp_body" ;;
+  esac
+}
+
+# ---- tiny JSON extractor --------------------------------------------
+# Same approach as the `claude` wrapper — sed-only, no jq dependency.
+# Only handles flat string and number fields, which is all the gateway
+# endpoints return at the top level. See M2/task-09 for the
+# precedent.
+
+json_str() {
+  printf '%s' "$1" \
+    | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1
+}
+
+json_num() {
+  printf '%s' "$1" \
+    | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p' \
+    | head -n 1
+}
+
+# ---- subcommands ----------------------------------------------------
+
+print_minted_key() {
+  body="$1"
+  key=$(json_str "$body" key)
+  alias=$(json_str "$body" key_alias)
+  team=$(json_str "$body" team_id)
+  exp=$(json_str "$body" expires_at)
+  bud=$(json_num "$body" monthly_budget_usd)
+  [ -n "$key" ] || die "gateway response missing 'key': $body"
+
+  cat <<EOF
+
+  Key minted. This is the only time it will be displayed.
+  Paste it into the GitHub repo's secrets and set ANTHROPIC_BASE_URL.
+
+  Repo:               ${repo}
+  Team:               ${team}
+  Alias:              ${alias}
+  Monthly budget:     \$${bud:-?}
+  Expires at:         ${exp:-?}
+
+  Add to GitHub → Settings → Secrets and variables → Actions:
+    secrets.ANTHROPIC_API_KEY     = ${key}
+    vars.ANTHROPIC_BASE_URL       = ${GATEWAY_URL}
+
+  Sample workflow snippet:
+    https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/examples/github-actions-claude.yml
+
+EOF
+}
+
+cmd_issue() {
+  ttl_field=""
+  [ -n "$ttl_days" ] && ttl_field=", \"ttl_days\": ${ttl_days}"
+  budget_field=""
+  [ -n "$budget" ] && budget_field=", \"monthly_budget_usd\": ${budget}"
+  payload="{\"repo\": \"${repo}\"${budget_field}${ttl_field}}"
+  body=$(http_call POST /issue-ci-key "$payload")
+  print_minted_key "$body"
+}
+
+cmd_rotate() {
+  payload="{\"repo\": \"${repo}\"}"
+  body=$(http_call POST /rotate-ci-key "$payload")
+  print_minted_key "$body"
+}
+
+cmd_revoke() {
+  payload="{\"repo\": \"${repo}\"}"
+  body=$(http_call POST /revoke-ci-key "$payload")
+  count=$(json_num "$body" revoked)
+  log "revoked ${count:-0} key(s) for ${repo}"
+}
+
+cmd_status() {
+  # URL-encode '/' in the repo path. Everything else GitHub allows is
+  # already URL-safe (alphanumerics, '.', '_', '-').
+  encoded_repo="${repo//\//%2F}"
+  body=$(http_call GET "/ci-key-status?repo=${encoded_repo}")
+  team=$(json_str "$body" team_id)
+  alias=$(json_str "$body" key_alias)
+  last4=$(json_str "$body" last4)
+  exp=$(json_str "$body" expires_at)
+  bud=$(json_num "$body" monthly_budget_usd)
+  spend=$(json_num "$body" current_period_spend_usd)
+  last_used=$(json_str "$body" last_used_at)
+  creator=$(json_str "$body" created_by_email)
+
+  cat <<EOF
+
+  Repo:                  ${repo}
+  Team:                  ${team}
+  Alias:                 ${alias}
+  Last 4 of key:         ${last4:-?}
+  Expires at:            ${exp:-?}
+  Monthly budget:        \$${bud:-?}
+  Spend this period:     \$${spend:-0}
+  Last used at:          ${last_used:-never}
+  Originally created by: ${creator:-?}
+
+EOF
+}
+
+case "$cmd" in
+  issue-ci-key)   cmd_issue ;;
+  rotate-ci-key)  cmd_rotate ;;
+  revoke-ci-key)  cmd_revoke ;;
+  ci-key-status)  cmd_status ;;
+esac

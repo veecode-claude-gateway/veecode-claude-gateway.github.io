@@ -81,6 +81,21 @@ claude --version</code></pre>
 <pre><code>export CLAUDE_GATEWAY_URL=https://your-other-gateway.example
 curl -fsSL https://veecode-claude-gateway.github.io/install.sh | bash</code></pre>
 
+  <h2>For repo owners: CI virtual keys</h2>
+  <p>
+    Need Claude Code to run from GitHub Actions? Mint a long-lived virtual key scoped to a single repo,
+    with spend bucketed to the repo (not to your personal budget). Install the companion CLI:
+  </p>
+<pre><code>curl -fsSL https://veecode-claude-gateway.github.io/install-claude-gateway.sh | bash</code></pre>
+  <p>Then, from a terminal where <code>gcloud</code> is logged in:</p>
+<pre><code>claude-gateway issue-ci-key --repo owner/name --budget 25 --ttl 90d</code></pre>
+  <p>
+    The CLI prints the key once — paste it into <code>secrets.ANTHROPIC_API_KEY</code> on the repo and set
+    <code>vars.ANTHROPIC_BASE_URL</code> to the gateway URL above. Other subcommands:
+    <code>rotate-ci-key</code>, <code>revoke-ci-key</code>, <code>ci-key-status</code>. Full walkthrough:
+    <a href="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/ci-keys.md">docs/ci-keys.md</a>.
+  </p>
+
   <h2>Reporting issues</h2>
   <p>
     File a GitHub issue at
