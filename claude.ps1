@@ -68,7 +68,7 @@ if (-not $key -or ($expiresAt - [DateTime]::UtcNow).TotalSeconds -lt 3600) {
 $env:ANTHROPIC_BASE_URL        = $GatewayUrl
 $env:ANTHROPIC_API_KEY         = $key
 $env:CLAUDE_CONFIG_DIR         = (Join-Path $ConfigDir 'claude')
-$env:ANTHROPIC_DEFAULT_HEADERS = "x-claude-gateway-cli: $WrapperVersion"
+$env:ANTHROPIC_CUSTOM_HEADERS = "x-claude-gateway-cli: $WrapperVersion"
 New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
 
 & $RealClaude @args
