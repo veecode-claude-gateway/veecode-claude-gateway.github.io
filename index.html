@@ -26,12 +26,28 @@
       background: #eef2ff; color: #3730a3; font-size: 0.78rem; font-weight: 600;
       letter-spacing: 0.02em; vertical-align: middle;
     }
+    table.modes {
+      border-collapse: collapse; width: 100%; font-size: 0.9rem; margin: 1rem 0;
+    }
+    table.modes th, table.modes td {
+      border-bottom: 1px solid #e5e7eb; padding: 0.55rem 0.6rem; vertical-align: top;
+      text-align: left;
+    }
+    table.modes th { font-weight: 600; background: #f9fafb; }
+    table.modes td.center { text-align: center; }
+    .preview-note {
+      background: #fef3c7; border-left: 3px solid #d97706; padding: 0.65rem 0.85rem;
+      border-radius: 4px; font-size: 0.92rem;
+    }
     @media (prefers-color-scheme: dark) {
       body { background: #0d1117; color: #e6edf3; }
       .lede { color: #8b949e; }
       pre { background: #161b22; }
       a { color: #58a6ff; }
       .pill { background: #1f2937; color: #a5b4fc; }
+      table.modes th, table.modes td { border-bottom-color: #30363d; }
+      table.modes th { background: #161b22; }
+      .preview-note { background: #2d2306; border-left-color: #d97706; }
     }
     footer { margin-top: 3rem; color: #888; font-size: 0.85rem; }
   </style>
@@ -56,7 +72,81 @@
   <h2>Install (Windows PowerShell 7+)</h2>
 <pre><code>iwr https://veecode-claude-gateway.github.io/install.ps1 | iex</code></pre>
 
-  <h2>What it does</h2>
+  <h2>Modes</h2>
+  <p class="preview-note">
+    <strong>Target state</strong> after the team-plan OAuth pass-through rollout
+    (tracked in the meta-repo plan <code>team-plan-oauth-passthrough.md</code>). Until that
+    ships, the wrapper always operates as <strong>case 4</strong> below.
+  </p>
+  <table class="modes">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Setup</th>
+        <th>Auth path</th>
+        <th class="center">Gateway</th>
+        <th class="center">LiteLLM<br>telemetry</th>
+        <th class="center">CLI<br>telemetry</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><strong>No wrapper.</strong> Real <code>claude</code> directly.</td>
+        <td>Anthropic OAuth → <code>api.anthropic.com</code></td>
+        <td class="center">❌</td>
+        <td class="center">❌</td>
+        <td class="center">❌ <sup>1</sup></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><strong>Wrapper, OAuth already valid.</strong> Default mode.</td>
+        <td>Anthropic OAuth → gateway → Anthropic</td>
+        <td class="center">✅</td>
+        <td class="center">✅</td>
+        <td class="center">✅</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><strong>Wrapper, no OAuth yet.</strong> Default mode.</td>
+        <td>Claude Code prompts <code>claude login</code>; after login → case 2</td>
+        <td class="center">✅ <sup>2</sup></td>
+        <td class="center">✅</td>
+        <td class="center">✅</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><strong>Wrapper + <code>CLAUDE_GATEWAY_USE_API_KEY=1</code>.</strong> Legacy path; CI when Claude Code is involved.</td>
+        <td>gcloud → <code>/issue-key</code> → virtual key → gateway → upstream API key → Anthropic</td>
+        <td class="center">✅</td>
+        <td class="center">✅</td>
+        <td class="center">✅</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><strong>CI workflow with a CI virtual key, no wrapper.</strong> Plain HTTP from a script/SDK.</td>
+        <td><code>Authorization: Bearer sk-…</code> → gateway → upstream API key → Anthropic</td>
+        <td class="center">✅</td>
+        <td class="center">✅</td>
+        <td class="center">❌ <sup>3</sup></td>
+      </tr>
+    </tbody>
+  </table>
+  <p style="font-size: 0.85rem; color: #6b7280;">
+    <sup>1</sup> Unless the user has set <code>CLAUDE_CODE_ENABLE_TELEMETRY=1</code> outside the wrapper's env, in which case the laptop emits CLI telemetry to wherever they configured. Out of scope here.<br>
+    <sup>2</sup> During <code>claude login</code>, Claude Code talks to Anthropic Console (browser/device-code flow), not <code>ANTHROPIC_BASE_URL</code>. Login works regardless of gateway state. After login, subsequent <code>/v1/messages</code> calls follow case 2.<br>
+    <sup>3</sup> No Claude Code process means no <code>claude_code.*</code> metrics. CI rows show up only on the LiteLLM-source path, with <code>user_email=ci:owner/repo</code> from the CI key's team metadata.
+  </p>
+
+  <h3>Identity attribution on the OAuth path</h3>
+  <p>
+    Set <code>CLAUDE_GATEWAY_API_USER</code> in your shell profile to your email so server-side telemetry
+    attributes requests to you (the wrapper sends it as <code>x-claude-gateway-user</code>; the gateway
+    picks it up). If unset, the header value defaults to <code>claude-gw-user</code>. Trust level is
+    laptop-set, same as <code>client_version</code>.
+  </p>
+
+  <h2>What it does today (case 4)</h2>
   <p>
     Drops a thin <code>claude</code> wrapper ahead of the real binary on <code>PATH</code>. On invocation
     it exchanges your <code>gcloud</code> access token for a short-lived gateway virtual key (cached at
