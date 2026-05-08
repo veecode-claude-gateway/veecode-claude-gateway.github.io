@@ -25,6 +25,7 @@ LAST_CHECK_FILE="$CONFIG_DIR/last_check"
 INSTALL_PATH="$HOME/.claude-gateway/bin/claude"
 WRAPPER_URL="https://veecode-claude-gateway.github.io/claude"
 DEFAULT_GATEWAY_URL="https://claude-gateway.vee.codes"
+DEFAULT_OTEL_ENDPOINT="http://claudemonitor.vtgdev.net:4317"
 RUNBOOK_URL="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/runbooks/"
 
 UPDATE_CADENCE_S=$((24 * 60 * 60))
@@ -68,12 +69,18 @@ iso_to_epoch() {
 # The config file is plain `KEY="value"` lines, sourced as bash. Mode
 # 600 by convention. Owner-managed: edit to override the gateway URL.
 GATEWAY_URL="$DEFAULT_GATEWAY_URL"
+OTEL_ENDPOINT="$DEFAULT_OTEL_ENDPOINT"
 if [ -r "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
   . "$CONFIG_FILE"
+  # Older configs (pre-ADR-0009) don't carry OTEL_ENDPOINT; sourcing
+  # leaves the default in place. No migration needed.
 else
   umask 077
-  printf 'GATEWAY_URL="%s"\n' "$GATEWAY_URL" > "$CONFIG_FILE"
+  {
+    printf 'GATEWAY_URL="%s"\n' "$GATEWAY_URL"
+    printf 'OTEL_ENDPOINT="%s"\n' "$OTEL_ENDPOINT"
+  } > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 fi
 
@@ -263,5 +270,33 @@ unset ANTHROPIC_API_KEY
 export CLAUDE_CONFIG_DIR="$CONFIG_DIR/claude"
 export ANTHROPIC_CUSTOM_HEADERS="x-claude-gateway-cli: $WRAPPER_VERSION"
 mkdir -p "$CLAUDE_CONFIG_DIR"
+
+# ---- native Claude Code OTEL telemetry (ADR-0009) ---------------------
+# Light up Claude Code's built-in OTLP exporter so the laptop side of the
+# data path emits to the org collector alongside the LiteLLM-source
+# metrics the gateway emits. The user.email here is laptop-set (gcloud
+# account) and laptop-trusted; the LiteLLM-source label `user_email` on
+# the gateway metrics is server-validated and the source of truth for
+# spend. See ADR-0009 for the trust boundary.
+#
+# Set CLAUDE_GATEWAY_NO_TELEMETRY=1 to opt out entirely (e.g. when on a
+# network where claudemonitor.vtgdev.net isn't reachable). Without an
+# explicit opt-out there's no behaviour change vs the M2 wrapper —
+# Claude Code only emits when CLAUDE_CODE_ENABLE_TELEMETRY=1, so a
+# missing env block here means "no telemetry" too.
+if [ -z "${CLAUDE_GATEWAY_NO_TELEMETRY:-}" ] && [ -n "${OTEL_ENDPOINT:-}" ]; then
+  otel_user=${USER_EMAIL:-}
+  if [ -z "$otel_user" ] && command -v gcloud >/dev/null 2>&1; then
+    otel_user=$(gcloud config get-value account 2>/dev/null | head -1 || true)
+  fi
+  otel_host=$(hostname 2>/dev/null || echo "unknown")
+
+  export CLAUDE_CODE_ENABLE_TELEMETRY=1
+  export OTEL_METRICS_EXPORTER=otlp
+  export OTEL_LOGS_EXPORTER=otlp
+  export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+  export OTEL_EXPORTER_OTLP_ENDPOINT="$OTEL_ENDPOINT"
+  export OTEL_RESOURCE_ATTRIBUTES="user.email=${otel_user},host.name=${otel_host},client.version=${WRAPPER_VERSION},service.name=claude-code-cli"
+fi
 
 exec "$REAL_CLAUDE" "$@"

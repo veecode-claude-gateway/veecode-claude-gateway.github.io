@@ -78,5 +78,30 @@ $env:CLAUDE_CONFIG_DIR        = (Join-Path $ConfigDir 'claude')
 $env:ANTHROPIC_CUSTOM_HEADERS = "x-claude-gateway-cli: $WrapperVersion"
 New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
 
+# Native Claude Code OTEL telemetry (ADR-0009). Mirror of the POSIX
+# wrapper block. Endpoint is hardcoded here until claude.ps1 gets the
+# same runtime self-resolve refactor the POSIX wrapper got; override
+# at the parent shell with $env:CLAUDE_GATEWAY_OTEL_ENDPOINT.
+# CLAUDE_GATEWAY_NO_TELEMETRY=1 opts out (e.g. on a network where
+# claudemonitor.vtgdev.net isn't reachable).
+if (-not $env:CLAUDE_GATEWAY_NO_TELEMETRY) {
+    $otelEndpoint = if ($env:CLAUDE_GATEWAY_OTEL_ENDPOINT) {
+        $env:CLAUDE_GATEWAY_OTEL_ENDPOINT
+    } else {
+        'http://claudemonitor.vtgdev.net:4317'
+    }
+    $otelUser = $env:USER_EMAIL
+    if (-not $otelUser) {
+        try { $otelUser = (& gcloud config get-value account 2>$null | Select-Object -First 1) } catch {}
+    }
+    $otelHost = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'unknown' }
+    $env:CLAUDE_CODE_ENABLE_TELEMETRY    = '1'
+    $env:OTEL_METRICS_EXPORTER           = 'otlp'
+    $env:OTEL_LOGS_EXPORTER              = 'otlp'
+    $env:OTEL_EXPORTER_OTLP_PROTOCOL     = 'grpc'
+    $env:OTEL_EXPORTER_OTLP_ENDPOINT     = $otelEndpoint
+    $env:OTEL_RESOURCE_ATTRIBUTES        = "user.email=$otelUser,host.name=$otelHost,client.version=$WrapperVersion,service.name=claude-code-cli"
+}
+
 & $RealClaude @args
 exit $LASTEXITCODE
