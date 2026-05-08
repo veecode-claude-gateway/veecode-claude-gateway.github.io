@@ -15,9 +15,16 @@ function Die([string]$msg) { Write-Error "claude-gateway: $msg"; exit 1 }
 
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
+# Default mode: OAuth pass-through (Claude Code's own login flow handles
+# auth; the gateway forwards the resulting Bearer token upstream). Set
+# CLAUDE_GATEWAY_USE_API_KEY=1 to force the gcloud → /issue-key →
+# virtual-key flow (CI workflows; users without a Team-plan login).
+$UseApiKey = [bool]$env:CLAUDE_GATEWAY_USE_API_KEY
+$ApiUser = if ($env:CLAUDE_GATEWAY_API_USER) { $env:CLAUDE_GATEWAY_API_USER } else { 'claude-gw-user' }
+
 $key = $null
 $expiresAt = [DateTime]::MinValue
-if (Test-Path $KeyFile) {
+if ($UseApiKey -and (Test-Path $KeyFile)) {
     $lines = Get-Content $KeyFile
     if ($lines.Count -ge 2) {
         $key = $lines[0]
@@ -25,7 +32,7 @@ if (Test-Path $KeyFile) {
     }
 }
 
-if (-not $key -or ($expiresAt - [DateTime]::UtcNow).TotalSeconds -lt 3600) {
+if ($UseApiKey -and (-not $key -or ($expiresAt - [DateTime]::UtcNow).TotalSeconds -lt 3600)) {
     if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
         Die "gcloud not found on PATH. Install gcloud and run 'gcloud auth login'. See $Runbook."
     }
@@ -66,16 +73,24 @@ if (-not $key -or ($expiresAt - [DateTime]::UtcNow).TotalSeconds -lt 3600) {
 }
 
 $env:ANTHROPIC_BASE_URL       = $GatewayUrl
-# Bearer auth, not x-api-key. The gateway's custom_auth.py reads only
-# the Authorization header; with ANTHROPIC_API_KEY set Claude Code
-# sends `x-api-key: <vk>` and every /v1/messages 401s. POSIX wrapper
-# was fixed in 174c656; this is the parity fix for Windows. Remove
-# any pre-existing ANTHROPIC_API_KEY in the parent env so it doesn't
-# override the auth-token path Claude Code falls back through.
-$env:ANTHROPIC_AUTH_TOKEN     = $key
-Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+if ($UseApiKey) {
+    # Bearer auth, not x-api-key. The gateway's custom_auth.py reads only
+    # the Authorization header; with ANTHROPIC_API_KEY set Claude Code
+    # sends `x-api-key: <vk>` and every /v1/messages 401s. POSIX wrapper
+    # was fixed in 174c656; same fix for Windows. Remove any pre-existing
+    # ANTHROPIC_API_KEY in the parent env so it doesn't override the
+    # auth-token path Claude Code falls back through.
+    Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+    $env:ANTHROPIC_AUTH_TOKEN = $key
+}
+# Default mode: do not touch ANTHROPIC_AUTH_TOKEN — Claude Code handles
+# its own login flow and the gateway forwards the resulting token
+# upstream.
 $env:CLAUDE_CONFIG_DIR        = (Join-Path $ConfigDir 'claude')
-$env:ANTHROPIC_CUSTOM_HEADERS = "x-claude-gateway-cli: $WrapperVersion"
+# Two custom headers, newline-separated; Claude Code splits into
+# individual HTTP headers. x-claude-gateway-user is laptop-trusted
+# identity for server-side attribution on the OAuth path.
+$env:ANTHROPIC_CUSTOM_HEADERS = "x-claude-gateway-cli: $WrapperVersion`nx-claude-gateway-user: $ApiUser"
 New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
 
 # Native Claude Code OTEL telemetry (ADR-0009). Mirror of the POSIX
@@ -90,9 +105,12 @@ if (-not $env:CLAUDE_GATEWAY_NO_TELEMETRY) {
     } else {
         'http://claudemonitor.vtgdev.net:4317'
     }
-    $otelUser = $env:USER_EMAIL
-    if (-not $otelUser) {
-        try { $otelUser = (& gcloud config get-value account 2>$null | Select-Object -First 1) } catch {}
+    $otelUser = if ($env:USER_EMAIL) { $env:USER_EMAIL } else { $ApiUser }
+    if ($otelUser -eq 'claude-gw-user') {
+        try {
+            $gcloudEmail = (& gcloud config get-value account 2>$null | Select-Object -First 1)
+            if ($gcloudEmail) { $otelUser = $gcloudEmail }
+        } catch {}
     }
     $otelHost = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'unknown' }
     $env:CLAUDE_CODE_ENABLE_TELEMETRY    = '1'

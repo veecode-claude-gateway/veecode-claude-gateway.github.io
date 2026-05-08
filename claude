@@ -183,55 +183,80 @@ maybe_self_update "$@"
 REAL_CLAUDE=$(resolve_real_claude) \
   || die "could not find a real 'claude' binary on PATH (excluding the wrapper). Install Claude Code: https://docs.claude.com/en/docs/claude-code"
 
-# ---- key-cache load ---------------------------------------------------
+# ---- mode selection ---------------------------------------------------
+# Default: OAuth pass-through. Wrapper does not mint or set
+# ANTHROPIC_AUTH_TOKEN; Claude Code's own login flow handles auth and
+# the gateway forwards whatever Bearer token Claude Code chooses to
+# send. Usage bills against the user's Team-plan seat.
+#
+# Opt-in: CLAUDE_GATEWAY_USE_API_KEY=1 (presence-based, matching the
+# CLAUDE_GATEWAY_NO_UPDATE / _QUIET / _NO_TELEMETRY conventions).
+# Wrapper does today's gcloud → /issue-key → cached virtual-key flow
+# and bills against the platform's ANTHROPIC_API_KEY. CI workflows and
+# users without a Team-plan login take this path.
+#
+# Identity attribution on the OAuth path uses CLAUDE_GATEWAY_API_USER
+# (set in shell profile to user's email; default placeholder
+# "claude-gw-user" so the metric series is stable).
+USE_API_KEY=""
+if [ -n "${CLAUDE_GATEWAY_USE_API_KEY:-}" ]; then
+  USE_API_KEY=1
+fi
+
+API_USER=${CLAUDE_GATEWAY_API_USER:-claude-gw-user}
+
 now=$(date -u +%s)
 key=""; expires_at_epoch=0; exp_iso=""
-if [ -r "$KEY_FILE" ]; then
-  key=$(sed -n '1p' "$KEY_FILE" 2>/dev/null || true)
-  exp_iso=$(sed -n '2p' "$KEY_FILE" 2>/dev/null || true)
-  [ -n "${exp_iso:-}" ] && expires_at_epoch=$(iso_to_epoch "$exp_iso")
-fi
 
-# ---- invalidate cached key if minted under a different wrapper --------
-# Cheap, deterministic invalidation: when this script's content changes
-# (manual re-install OR self-update above), the cached key may have been
-# minted under assumptions the new code doesn't share (env-var rename,
-# header rename, etc.). Re-mint instead of using a key the new code
-# wouldn't have produced.
-key_meta=$(cat "$KEY_META" 2>/dev/null || echo "")
-if [ -n "$SELF_HASH" ] && [ -n "$key_meta" ] && [ "$key_meta" != "$SELF_HASH" ]; then
-  key=""
-fi
+if [ -n "$USE_API_KEY" ]; then
+  # ---- key-cache load -------------------------------------------------
+  if [ -r "$KEY_FILE" ]; then
+    key=$(sed -n '1p' "$KEY_FILE" 2>/dev/null || true)
+    exp_iso=$(sed -n '2p' "$KEY_FILE" 2>/dev/null || true)
+    [ -n "${exp_iso:-}" ] && expires_at_epoch=$(iso_to_epoch "$exp_iso")
+  fi
 
-# ---- mint or refresh --------------------------------------------------
-if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt "$KEY_REFRESH_THRESHOLD_S" ]; then
-  command -v gcloud >/dev/null 2>&1 \
-    || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
-  token=$(gcloud auth print-access-token 2>/dev/null) \
-    || die "'gcloud auth print-access-token' failed. Run 'gcloud auth login'."
-  tmp=$(mktemp -t claude-gateway.XXXXXX) || die "mktemp failed"
-  http_code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 \
-      -X POST "$GATEWAY_URL/issue-key" \
-      -H "Authorization: Bearer $token" \
-      -H "Content-Type: application/json" -d '{}') || {
-    rm -f "$tmp"
-    die "could not reach gateway at $GATEWAY_URL (network/DNS/TLS failure). See ${RUNBOOK_URL}."
-  }
-  resp=$(cat "$tmp"); rm -f "$tmp"
-  case "$http_code" in
-    2*) : ;;
-    401|403) die "gateway rejected your identity ($http_code): $resp. Run 'gcloud auth login' if your token has expired." ;;
-    5*)      die "gateway error $http_code from /issue-key: $resp. See ${RUNBOOK_URL}." ;;
-    *)       die "unexpected gateway response $http_code: $resp" ;;
-  esac
-  key=$(printf '%s' "$resp" | sed -n 's/.*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  exp_iso=$(printf '%s' "$resp" | sed -n 's/.*"expires_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  [ -n "$key" ] || die "gateway response missing 'key': $resp"
-  umask 077
-  printf '%s\n%s\n' "$key" "$exp_iso" > "$KEY_FILE"
-  chmod 600 "$KEY_FILE"
-  [ -n "$SELF_HASH" ] && printf '%s\n' "$SELF_HASH" > "$KEY_META"
-  expires_at_epoch=$(iso_to_epoch "$exp_iso")
+  # ---- invalidate cached key if minted under a different wrapper ------
+  # Cheap, deterministic invalidation: when this script's content
+  # changes (manual re-install OR self-update above), the cached key
+  # may have been minted under assumptions the new code doesn't share
+  # (env-var rename, header rename, etc.). Re-mint instead of using a
+  # key the new code wouldn't have produced.
+  key_meta=$(cat "$KEY_META" 2>/dev/null || echo "")
+  if [ -n "$SELF_HASH" ] && [ -n "$key_meta" ] && [ "$key_meta" != "$SELF_HASH" ]; then
+    key=""
+  fi
+
+  # ---- mint or refresh ------------------------------------------------
+  if [ -z "$key" ] || [ "$((expires_at_epoch - now))" -lt "$KEY_REFRESH_THRESHOLD_S" ]; then
+    command -v gcloud >/dev/null 2>&1 \
+      || die "gcloud not found on PATH. Install + 'gcloud auth login'. See ${RUNBOOK_URL}."
+    token=$(gcloud auth print-access-token 2>/dev/null) \
+      || die "'gcloud auth print-access-token' failed. Run 'gcloud auth login'."
+    tmp=$(mktemp -t claude-gateway.XXXXXX) || die "mktemp failed"
+    http_code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 \
+        -X POST "$GATEWAY_URL/issue-key" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" -d '{}') || {
+      rm -f "$tmp"
+      die "could not reach gateway at $GATEWAY_URL (network/DNS/TLS failure). See ${RUNBOOK_URL}."
+    }
+    resp=$(cat "$tmp"); rm -f "$tmp"
+    case "$http_code" in
+      2*) : ;;
+      401|403) die "gateway rejected your identity ($http_code): $resp. Run 'gcloud auth login' if your token has expired." ;;
+      5*)      die "gateway error $http_code from /issue-key: $resp. See ${RUNBOOK_URL}." ;;
+      *)       die "unexpected gateway response $http_code: $resp" ;;
+    esac
+    key=$(printf '%s' "$resp" | sed -n 's/.*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    exp_iso=$(printf '%s' "$resp" | sed -n 's/.*"expires_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$key" ] || die "gateway response missing 'key': $resp"
+    umask 077
+    printf '%s\n%s\n' "$key" "$exp_iso" > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    [ -n "$SELF_HASH" ] && printf '%s\n' "$SELF_HASH" > "$KEY_META"
+    expires_at_epoch=$(iso_to_epoch "$exp_iso")
+  fi
 fi
 
 # ---- banner (stderr only, ≤2 lines, suppressible) ---------------------
@@ -239,13 +264,18 @@ fi
 # through a gateway, then mis-attribute weird behaviour to Anthropic.
 # Set CLAUDE_GATEWAY_QUIET=1 to suppress.
 if [ -t 2 ] && ! quiet; then
-  identity=$(gcloud config get-value account 2>/dev/null | head -1 || true)
-  [ -n "$identity" ] || identity="(no gcloud account)"
+  if [ -n "$USE_API_KEY" ]; then
+    identity=$(gcloud config get-value account 2>/dev/null | head -1 || true)
+    [ -n "$identity" ] || identity="(no gcloud account)"
 
-  secs_left=$((expires_at_epoch - now))
-  if [ "$secs_left" -le 0 ]; then key_state="expired"
-  elif [ "$secs_left" -ge 3600 ]; then key_state="$((secs_left / 3600))h left"
-  else key_state="$((secs_left / 60))m left"
+    secs_left=$((expires_at_epoch - now))
+    if [ "$secs_left" -le 0 ]; then state_label="expired"
+    elif [ "$secs_left" -ge 3600 ]; then state_label="key $((secs_left / 3600))h left"
+    else state_label="key $((secs_left / 60))m left"
+    fi
+  else
+    identity="$API_USER"
+    state_label="team-plan"
   fi
 
   last=$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo 0)
@@ -259,16 +289,32 @@ if [ -t 2 ] && ! quiet; then
 
   gw_host=${GATEWAY_URL#http*://}
   printf '%s▰ Claude Gateway%s · %s\n' "$C_BOLD_CYAN" "$C_RESET" "$identity" >&2
-  printf '%s  key %s · wrapper %s (checked %s) · via %s%s\n' \
-    "$C_DIM" "$key_state" "$WRAPPER_VERSION" "$checked" "$gw_host" "$C_RESET" >&2
+  printf '%s  %s · wrapper %s (checked %s) · via %s%s\n' \
+    "$C_DIM" "$state_label" "$WRAPPER_VERSION" "$checked" "$gw_host" "$C_RESET" >&2
 fi
 
 # ---- exec the real claude ---------------------------------------------
 export ANTHROPIC_BASE_URL="$GATEWAY_URL"
-export ANTHROPIC_AUTH_TOKEN="$key"
-unset ANTHROPIC_API_KEY
+if [ -n "$USE_API_KEY" ]; then
+  unset ANTHROPIC_API_KEY
+  export ANTHROPIC_AUTH_TOKEN="$key"
+fi
+# Default mode: do not touch ANTHROPIC_AUTH_TOKEN — Claude Code handles
+# its own login flow (`claude login` if no creds, OAuth refresh if
+# stale) and the gateway forwards the resulting Authorization header
+# upstream.
 export CLAUDE_CONFIG_DIR="$CONFIG_DIR/claude"
-export ANTHROPIC_CUSTOM_HEADERS="x-claude-gateway-cli: $WRAPPER_VERSION"
+# Custom headers Claude Code sends on every request. Newline-separated
+# in the env var; Claude Code splits into individual HTTP headers.
+#   x-claude-gateway-cli  → wrapper version (sha256 of self, first 7 chars)
+#                           Read by otel_logger as `client_version` label.
+#   x-claude-gateway-user → identity for server-side attribution on
+#                           the OAuth-passthrough path (laptop-trusted;
+#                           defaults to "claude-gw-user" placeholder so
+#                           dashboards can filter the un-attributed
+#                           cohort cleanly).
+export ANTHROPIC_CUSTOM_HEADERS="x-claude-gateway-cli: $WRAPPER_VERSION
+x-claude-gateway-user: $API_USER"
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
 # ---- native Claude Code OTEL telemetry (ADR-0009) ---------------------
@@ -285,9 +331,16 @@ mkdir -p "$CLAUDE_CONFIG_DIR"
 # Claude Code only emits when CLAUDE_CODE_ENABLE_TELEMETRY=1, so a
 # missing env block here means "no telemetry" too.
 if [ -z "${CLAUDE_GATEWAY_NO_TELEMETRY:-}" ] && [ -n "${OTEL_ENDPOINT:-}" ]; then
-  otel_user=${USER_EMAIL:-}
-  if [ -z "$otel_user" ] && command -v gcloud >/dev/null 2>&1; then
-    otel_user=$(gcloud config get-value account 2>/dev/null | head -1 || true)
+  # CLI-source user.email: prefer USER_EMAIL if explicitly set (some
+  # environments have it pre-populated), then API_USER (which is
+  # CLAUDE_GATEWAY_API_USER or the documented placeholder), then
+  # gcloud as a last resort for the API-key path. This keeps the
+  # CLI-source attribute aligned with the LiteLLM-source label so
+  # dashboards joining on user.email match.
+  otel_user=${USER_EMAIL:-$API_USER}
+  if [ "$otel_user" = "claude-gw-user" ] && command -v gcloud >/dev/null 2>&1; then
+    gcloud_email=$(gcloud config get-value account 2>/dev/null | head -1 || true)
+    [ -n "$gcloud_email" ] && otel_user="$gcloud_email"
   fi
   otel_host=$(hostname 2>/dev/null || echo "unknown")
 
