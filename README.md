@@ -30,7 +30,7 @@ Both honor `CLAUDE_GATEWAY_URL` to override the gateway endpoint at install time
 
 ## Modes
 
-> Target state after the team-plan OAuth pass-through rollout (see meta-repo plan `team-plan-oauth-passthrough.md`). Until that ships, the wrapper always operates as case 4 below.
+The wrapper picks one auth source per session. Default is OAuth pass-through (cases 2/3); set `CLAUDE_GATEWAY_USE_API_KEY=1` to fall back to the gcloud → virtual-key flow (case 4). Decision logic lives at the top of `claude` / `claude.ps1`. See [ADR-0010](https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/adr/0010-team-plan-oauth-passthrough.md) in the meta-repo.
 
 | # | Setup | Auth path | Gateway | LiteLLM telemetry | CLI telemetry |
 |---|---|---|---|---|---|

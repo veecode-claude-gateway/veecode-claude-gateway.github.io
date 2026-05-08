@@ -35,10 +35,6 @@
     }
     table.modes th { font-weight: 600; background: #f9fafb; }
     table.modes td.center { text-align: center; }
-    .preview-note {
-      background: #fef3c7; border-left: 3px solid #d97706; padding: 0.65rem 0.85rem;
-      border-radius: 4px; font-size: 0.92rem;
-    }
     @media (prefers-color-scheme: dark) {
       body { background: #0d1117; color: #e6edf3; }
       .lede { color: #8b949e; }
@@ -47,23 +43,20 @@
       .pill { background: #1f2937; color: #a5b4fc; }
       table.modes th, table.modes td { border-bottom-color: #30363d; }
       table.modes th { background: #161b22; }
-      .preview-note { background: #2d2306; border-left-color: #d97706; }
     }
     footer { margin-top: 3rem; color: #888; font-size: 0.85rem; }
   </style>
 </head>
 <body>
-  <h1>VeeCode Claude Gateway <span class="pill">M2 pilot</span></h1>
+  <h1>VeeCode Claude Gateway <span class="pill">live</span></h1>
   <p class="lede">
-    Corporate gateway for Claude Code: Google identity in, attributable spend + audit logs out.
-    Routes <code>claude</code> through <code>https://claude-gateway.vee.codes</code>.
+    Corporate gateway for Claude Code. By default, your existing Anthropic Team-plan login rides through to <code>https://claude-gateway.vee.codes</code> for attributable spend + audit logs.
   </p>
 
   <h2>Prerequisites</h2>
   <ul>
-    <li>A Google Workspace account on a permitted domain</li>
-    <li><a href="https://cloud.google.com/sdk/docs/install"><code>gcloud</code></a> installed and authenticated once: <code>gcloud auth login</code></li>
-    <li><a href="https://docs.claude.com/en/docs/claude-code">Claude Code</a> already installed (<code>npm i -g @anthropic-ai/claude-code</code>) — the installer locates it on <code>PATH</code>, it does not install it for you</li>
+    <li><a href="https://docs.claude.com/en/docs/claude-code">Claude Code</a> already installed (<code>npm i -g @anthropic-ai/claude-code</code>) and an Anthropic Team-plan login (<code>claude login</code> once) — the installer locates the binary on <code>PATH</code>, it does not install it for you</li>
+    <li>For the API-key opt-in path only: a Google Workspace account on a permitted domain and <a href="https://cloud.google.com/sdk/docs/install"><code>gcloud</code></a> authenticated (<code>gcloud auth login</code>)</li>
   </ul>
 
   <h2>Install (macOS / Linux)</h2>
@@ -73,10 +66,8 @@
 <pre><code>iwr https://veecode-claude-gateway.github.io/install.ps1 | iex</code></pre>
 
   <h2>Modes</h2>
-  <p class="preview-note">
-    <strong>Target state</strong> after the team-plan OAuth pass-through rollout
-    (tracked in the meta-repo plan <code>team-plan-oauth-passthrough.md</code>). Until that
-    ships, the wrapper always operates as <strong>case 4</strong> below.
+  <p>
+    The wrapper picks one auth source per session. Default is OAuth pass-through (cases 2/3 below); set <code>CLAUDE_GATEWAY_USE_API_KEY=1</code> to fall back to the gcloud → virtual-key flow (case 4).
   </p>
   <table class="modes">
     <thead>
@@ -138,33 +129,38 @@
     <sup>3</sup> No Claude Code process means no <code>claude_code.*</code> metrics. CI rows show up only on the LiteLLM-source path, with <code>user_email=ci:owner/repo</code> from the CI key's team metadata.
   </p>
 
-  <h3>Identity attribution on the OAuth path</h3>
+  <h3>Identity attribution</h3>
   <p>
     Set <code>CLAUDE_GATEWAY_API_USER</code> in your shell profile to your email so server-side telemetry
     attributes requests to you (the wrapper sends it as <code>x-claude-gateway-user</code>; the gateway
     picks it up). If unset, the header value defaults to <code>claude-gw-user</code>. Trust level is
-    laptop-set, same as <code>client_version</code>.
+    laptop-set, same as <code>client_version</code>. Billing-grade attribution on the OAuth path comes
+    from Anthropic's Team-plan dashboard.
   </p>
 
-  <h2>What it does today (case 4)</h2>
+  <h2>What it does</h2>
   <p>
-    Drops a thin <code>claude</code> wrapper ahead of the real binary on <code>PATH</code>. On invocation
-    it exchanges your <code>gcloud</code> access token for a short-lived gateway virtual key (cached at
-    <code>~/.config/claude-gateway/key</code> for ~24h, mode 0600), points Claude Code at the gateway via
-    <code>ANTHROPIC_BASE_URL</code>, then <code>exec</code>s the real binary. You don't manage credentials.
+    Drops a thin <code>claude</code> wrapper ahead of the real binary on <code>PATH</code>. In default mode
+    it sets <code>ANTHROPIC_BASE_URL</code> and <code>exec</code>s the real binary — Claude Code uses its
+    normal logged-in OAuth token, the gateway forwards it upstream, usage bills against your Team-plan seat.
+    With <code>CLAUDE_GATEWAY_USE_API_KEY=1</code> it falls back to the gcloud → <code>/issue-key</code> →
+    cached virtual key flow (case 4).
   </p>
-  <p>The gateway logs <strong>metadata only</strong> — timestamp, model, token counts, your email. Conversation contents are not logged.</p>
+  <p>The gateway logs <strong>metadata only</strong> — timestamp, model, token counts, identity. Conversation contents are not logged.</p>
 
   <h2>Verify</h2>
 <pre><code>exec $SHELL    # or open a new terminal so PATH picks up the wrapper
 claude --version</code></pre>
 
   <h2>Troubleshooting</h2>
+  <h3>"Not logged in" on <code>claude -p</code></h3>
+  <p>Either your Claude Code OAuth session has expired (run <code>claude login</code>) or you're on an older wrapper. Force a self-update:</p>
+<pre><code>rm -f ~/.config/claude-gateway/last_check &amp;&amp; claude --version</code></pre>
   <h3>"gcloud not found" / "print-access-token failed"</h3>
-  <p>Install the gcloud CLI and run <code>gcloud auth login</code>. The wrapper needs a live identity to mint a key.</p>
+  <p>Only relevant on the <code>CLAUDE_GATEWAY_USE_API_KEY=1</code> path. Install the gcloud CLI and run <code>gcloud auth login</code>.</p>
   <h3>"could not reach gateway"</h3>
   <p>Check VPN / network. The gateway is at <code>https://claude-gateway.vee.codes</code>.</p>
-  <h3>Auth errors after working previously</h3>
+  <h3>Auth errors after working previously (API-key path)</h3>
   <p>The cached virtual key may have rotated. Force a refresh:</p>
 <pre><code>rm ~/.config/claude-gateway/key &amp;&amp; claude --version</code></pre>
   <h3>Switching gateways (advanced)</h3>
