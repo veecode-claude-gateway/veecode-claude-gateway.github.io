@@ -86,12 +86,20 @@ if ($UseApiKey) {
 # Default mode: do not touch ANTHROPIC_AUTH_TOKEN — Claude Code handles
 # its own login flow and the gateway forwards the resulting token
 # upstream.
-$env:CLAUDE_CONFIG_DIR        = (Join-Path $ConfigDir 'claude')
+# Isolate Claude Code's config dir only on the virtual-key path; let
+# default OAuth mode read real credentials from %APPDATA%\.claude.
+# Symptom of getting this wrong: `claude -p "..."` reports "Not logged
+# in" because the non-interactive credential discovery doesn't fall
+# back to the system credential store when CLAUDE_CONFIG_DIR points
+# at an empty sandbox.
+if ($UseApiKey) {
+    $env:CLAUDE_CONFIG_DIR = (Join-Path $ConfigDir 'claude')
+    New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
+}
 # Two custom headers, newline-separated; Claude Code splits into
 # individual HTTP headers. x-claude-gateway-user is laptop-trusted
 # identity for server-side attribution on the OAuth path.
 $env:ANTHROPIC_CUSTOM_HEADERS = "x-claude-gateway-cli: $WrapperVersion`nx-claude-gateway-user: $ApiUser"
-New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
 
 # Native Claude Code OTEL telemetry (ADR-0009). Mirror of the POSIX
 # wrapper block. Endpoint is hardcoded here until claude.ps1 gets the

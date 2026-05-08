@@ -303,7 +303,20 @@ fi
 # its own login flow (`claude login` if no creds, OAuth refresh if
 # stale) and the gateway forwards the resulting Authorization header
 # upstream.
-export CLAUDE_CONFIG_DIR="$CONFIG_DIR/claude"
+# Isolate Claude Code's config + state directory ONLY on the
+# virtual-key path. The original M1/M2 motive was to keep the gateway-
+# routed (sk-…) session from clobbering the developer's claude.ai
+# login at ~/.claude (M1 retro / task-03 finding). In default OAuth
+# mode the opposite is true: we *want* Claude Code to read the user's
+# real OAuth credentials from ~/.claude / macOS Keychain, since that
+# token is what we forward to the gateway. Symptom of getting this
+# wrong: `claude -p "..."` reports "Not logged in" because the
+# non-interactive credential-discovery path doesn't fall back to the
+# keychain when CLAUDE_CONFIG_DIR points at an empty sandbox.
+if [ -n "$USE_API_KEY" ]; then
+  export CLAUDE_CONFIG_DIR="$CONFIG_DIR/claude"
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+fi
 # Custom headers Claude Code sends on every request. Newline-separated
 # in the env var; Claude Code splits into individual HTTP headers.
 #   x-claude-gateway-cli  → wrapper version (sha256 of self, first 7 chars)
@@ -315,7 +328,6 @@ export CLAUDE_CONFIG_DIR="$CONFIG_DIR/claude"
 #                           cohort cleanly).
 export ANTHROPIC_CUSTOM_HEADERS="x-claude-gateway-cli: $WRAPPER_VERSION
 x-claude-gateway-user: $API_USER"
-mkdir -p "$CLAUDE_CONFIG_DIR"
 
 # ---- native Claude Code OTEL telemetry (ADR-0009) ---------------------
 # Light up Claude Code's built-in OTLP exporter so the laptop side of the
