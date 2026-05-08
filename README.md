@@ -28,6 +28,28 @@ iwr https://veecode-claude-gateway.github.io/install.ps1 | iex
 
 Both honor `CLAUDE_GATEWAY_URL` to override the gateway endpoint at install time.
 
+## Modes
+
+> Target state after the team-plan OAuth pass-through rollout (see meta-repo plan `team-plan-oauth-passthrough.md`). Until that ships, the wrapper always operates as case 4 below.
+
+| # | Setup | Auth path | Gateway | LiteLLM telemetry | CLI telemetry |
+|---|---|---|---|---|---|
+| 1 | **No wrapper.** Real `claude` directly. | Anthropic OAuth → `api.anthropic.com` | ❌ | ❌ | ❌ ¹ |
+| 2 | **Wrapper, OAuth already valid.** Default mode. | Anthropic OAuth → gateway → Anthropic | ✅ | ✅ | ✅ |
+| 3 | **Wrapper, no OAuth yet.** Default mode. | Claude Code prompts `claude login`; after login → case 2 | ✅ ² | ✅ | ✅ |
+| 4 | **Wrapper + `CLAUDE_GATEWAY_USE_API_KEY=1`.** Legacy path; CI when Claude Code is involved. | gcloud → `/issue-key` → virtual key → gateway → upstream API key → Anthropic | ✅ | ✅ | ✅ |
+| 5 | **CI workflow with a CI virtual key, no wrapper.** Plain HTTP from a script/SDK. | `Authorization: Bearer sk-…` → gateway → upstream API key → Anthropic | ✅ | ✅ | ❌ ³ |
+
+¹ Unless the user has set `CLAUDE_CODE_ENABLE_TELEMETRY=1` outside our env, in which case the laptop emits CLI telemetry to wherever they configured. Out of scope here.
+
+² During the `claude login` flow itself, Claude Code talks to Anthropic Console (browser/device-code flow), not `ANTHROPIC_BASE_URL`. Login works regardless of gateway state. After login completes, subsequent `/v1/messages` calls follow case 2.
+
+³ No Claude Code process means no `claude_code.*` metrics. CI rows show up only on the LiteLLM-source path, with `user_email=ci:owner/repo` from the CI key's team metadata.
+
+### Identity attribution on the OAuth path
+
+Set `CLAUDE_GATEWAY_API_USER` in your shell profile to your email so server-side telemetry attributes requests to you (the wrapper sends it as `x-claude-gateway-user`; the gateway picks it up). If unset, the header value defaults to `claude-gw-user`. Trust level is laptop-set, same as `client_version` today.
+
 ## Where docs and source live
 
 - **Architecture, ADRs, runbooks, roadmap** → [`claude-gateway-parent`](https://github.com/veecode-claude-gateway/claude-gateway-parent) (private)
