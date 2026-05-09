@@ -120,13 +120,16 @@ if (-not $env:CLAUDE_GATEWAY_NO_TELEMETRY) {
             if ($gcloudEmail) { $otelUser = $gcloudEmail }
         } catch {}
     }
+    $otelUsername = ($otelUser -split '@', 2)[0]
     $otelHost = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'unknown' }
     $env:CLAUDE_CODE_ENABLE_TELEMETRY    = '1'
     $env:OTEL_METRICS_EXPORTER           = 'otlp'
     $env:OTEL_LOGS_EXPORTER              = 'otlp'
     $env:OTEL_EXPORTER_OTLP_PROTOCOL     = 'grpc'
     $env:OTEL_EXPORTER_OTLP_ENDPOINT     = $otelEndpoint
-    $env:OTEL_RESOURCE_ATTRIBUTES        = "user.email=$otelUser,host.name=$otelHost,client.version=$WrapperVersion,service.name=claude-code-cli"
+    # Don't set service.name — Claude Code's SDK sets it internally and the
+    # org collector filters on that default; overriding it drops the export.
+    $env:OTEL_RESOURCE_ATTRIBUTES        = "user.email=$otelUser,user.name=$otelUsername,host.name=$otelHost,client.version=$WrapperVersion"
 }
 
 & $RealClaude @args

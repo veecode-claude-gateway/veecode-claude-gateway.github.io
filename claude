@@ -354,6 +354,7 @@ if [ -z "${CLAUDE_GATEWAY_NO_TELEMETRY:-}" ] && [ -n "${OTEL_ENDPOINT:-}" ]; the
     gcloud_email=$(gcloud config get-value account 2>/dev/null | head -1 || true)
     [ -n "$gcloud_email" ] && otel_user="$gcloud_email"
   fi
+  otel_username="${otel_user%%@*}"
   otel_host=$(hostname 2>/dev/null || echo "unknown")
 
   export CLAUDE_CODE_ENABLE_TELEMETRY=1
@@ -361,7 +362,11 @@ if [ -z "${CLAUDE_GATEWAY_NO_TELEMETRY:-}" ] && [ -n "${OTEL_ENDPOINT:-}" ]; the
   export OTEL_LOGS_EXPORTER=otlp
   export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
   export OTEL_EXPORTER_OTLP_ENDPOINT="$OTEL_ENDPOINT"
-  export OTEL_RESOURCE_ATTRIBUTES="user.email=${otel_user},host.name=${otel_host},client.version=${WRAPPER_VERSION},service.name=claude-code-cli"
+  # Don't set service.name — Claude Code's SDK sets it internally and the
+  # org collector filters on that default. Overriding it (even to a
+  # close-sounding value) drops the export silently in non-interactive
+  # `claude -p` runs.
+  export OTEL_RESOURCE_ATTRIBUTES="user.email=${otel_user},user.name=${otel_username},host.name=${otel_host},client.version=${WRAPPER_VERSION}"
 fi
 
 exec "$REAL_CLAUDE" "$@"
