@@ -20,7 +20,24 @@ New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 # CLAUDE_GATEWAY_USE_API_KEY=1 to force the gcloud → /issue-key →
 # virtual-key flow (CI workflows; users without a Team-plan login).
 $UseApiKey = [bool]$env:CLAUDE_GATEWAY_USE_API_KEY
-$ApiUser = if ($env:CLAUDE_GATEWAY_API_USER) { $env:CLAUDE_GATEWAY_API_USER } else { 'claude-gw-user' }
+# Identity attribution on the OAuth path. Three-step fallback so the
+# typical pilot sees their name on the dashboards without setting
+# anything: (1) CLAUDE_GATEWAY_API_USER if explicitly exported
+# (usually email; matches the server-validated label on the
+# API-key path); (2) $env:USERNAME on Windows or $env:USER on
+# PowerShell-on-Linux/macOS; (3) the well-known placeholder for
+# non-interactive contexts. Caveat: USERNAME yields a login name,
+# not an email — set CLAUDE_GATEWAY_API_USER explicitly if you
+# care about a unified view across API-key and OAuth paths.
+$ApiUser = if ($env:CLAUDE_GATEWAY_API_USER) {
+    $env:CLAUDE_GATEWAY_API_USER
+} elseif ($env:USERNAME) {
+    $env:USERNAME
+} elseif ($env:USER) {
+    $env:USER
+} else {
+    'claude-gw-user'
+}
 
 $key = $null
 $expiresAt = [DateTime]::MinValue

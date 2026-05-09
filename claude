@@ -9,11 +9,11 @@
 # derived from the script's own sha256 so it's always content-accurate.
 # What Pages serves is exactly what runs — no rendering step.
 #
-# Self-updating: once per UPDATE_CADENCE_S (24h, matching key TTL), curl
-# Pages, sha256-compare to self, atomic-replace + re-exec on mismatch.
-# Cache invalidation cascades: a wrapper-content change invalidates the
-# cached virtual key (key_meta carries the wrapper's self-hash). Failures
-# are fail-open — a Pages outage cannot brick `claude`.
+# Self-updating: once per UPDATE_CADENCE_S (1h), curl Pages,
+# sha256-compare to self, atomic-replace + re-exec on mismatch. Cache
+# invalidation cascades: a wrapper-content change invalidates the
+# cached virtual key (key_meta carries the wrapper's self-hash).
+# Failures are fail-open — a Pages outage cannot brick `claude`.
 set -eu
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway"
@@ -28,7 +28,7 @@ DEFAULT_GATEWAY_URL="https://claude-gateway.vee.codes"
 DEFAULT_OTEL_ENDPOINT="http://claudemonitor.vtgdev.net:4317"
 RUNBOOK_URL="https://github.com/veecode-claude-gateway/claude-gateway-parent/blob/main/docs/runbooks/"
 
-UPDATE_CADENCE_S=$((24 * 60 * 60))
+UPDATE_CADENCE_S=$((60 * 60))
 KEY_REFRESH_THRESHOLD_S=3600
 
 mkdir -p "$CONFIG_DIR"
@@ -195,15 +195,24 @@ REAL_CLAUDE=$(resolve_real_claude) \
 # and bills against the platform's ANTHROPIC_API_KEY. CI workflows and
 # users without a Team-plan login take this path.
 #
-# Identity attribution on the OAuth path uses CLAUDE_GATEWAY_API_USER
-# (set in shell profile to user's email; default placeholder
-# "claude-gw-user" so the metric series is stable).
+# Identity attribution on the OAuth path. Three-step fallback so the
+# typical pilot sees their name on the dashboards without setting
+# anything: (1) CLAUDE_GATEWAY_API_USER if the user has explicitly
+# exported it (usually their email — preferred since it matches the
+# server-validated label on the API-key path); (2) $USER, the POSIX
+# login name, set by every interactive shell; (3) the well-known
+# placeholder so the metric series is stable in non-interactive
+# contexts where neither is set. Caveat: $USER yields a username
+# like "andre", not "andre@vertigo.com.br", so a user who runs
+# *both* paths will appear under two label values in the Top-N
+# panels — explicitly set CLAUDE_GATEWAY_API_USER to your email if
+# you care about the unified view.
 USE_API_KEY=""
 if [ -n "${CLAUDE_GATEWAY_USE_API_KEY:-}" ]; then
   USE_API_KEY=1
 fi
 
-API_USER=${CLAUDE_GATEWAY_API_USER:-claude-gw-user}
+API_USER="${CLAUDE_GATEWAY_API_USER:-${USER:-claude-gw-user}}"
 
 now=$(date -u +%s)
 key=""; expires_at_epoch=0; exp_iso=""

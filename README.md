@@ -48,7 +48,13 @@ The wrapper picks one auth source per session. Default is OAuth pass-through (ca
 
 ### Identity attribution on the OAuth path
 
-Set `CLAUDE_GATEWAY_API_USER` in your shell profile to your email so server-side telemetry attributes requests to you (the wrapper sends it as `x-claude-gateway-user`; the gateway picks it up). If unset, the header value defaults to `claude-gw-user`. Trust level is laptop-set, same as `client_version` today.
+The wrapper sends `x-claude-gateway-user` on every request and the gateway uses it to populate the `user_email` Prometheus label. The wrapper picks the header value in three steps, first match wins:
+
+1. `CLAUDE_GATEWAY_API_USER` if you exported it (usually your email — recommended; this is the only form that matches the server-validated label on the API-key path, so a single user appears as a single row in the dashboards).
+2. `$USER` (POSIX) or `%USERNAME%` (Windows). Set by every interactive shell, so most pilots get attributed automatically without any setup — `andre`, `lcastro`, etc.
+3. The placeholder `claude-gw-user` if neither is available (non-interactive contexts only).
+
+Trust level is laptop-set, same as `client_version` — the gateway accepts the header on faith. The API-key path remains server-validated and is the source of truth for billing-grade attribution.
 
 ## Where docs and source live
 
