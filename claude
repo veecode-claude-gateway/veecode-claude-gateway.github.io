@@ -38,9 +38,10 @@ quiet() { [ -n "${CLAUDE_GATEWAY_QUIET:-}" ]; }
 
 # ---- ANSI (only when stderr is a TTY and NO_COLOR isn't set) ----------
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
-  C_BOLD_CYAN=$'\033[1;36m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
+  C_BOLD_CYAN=$'\033[1;36m'; C_BOLD_RED=$'\033[1;31m'
+  C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
 else
-  C_BOLD_CYAN=""; C_DIM=""; C_RESET=""
+  C_BOLD_CYAN=""; C_BOLD_RED=""; C_DIM=""; C_RESET=""
 fi
 
 # ---- portable sha256 (BSD shasum on macOS, GNU sha256sum on Linux) ----
@@ -273,18 +274,30 @@ fi
 # through a gateway, then mis-attribute weird behaviour to Anthropic.
 # Set CLAUDE_GATEWAY_QUIET=1 to suppress.
 if [ -t 2 ] && ! quiet; then
+  # Line 1 is the cost-regime signal, NOT the identity. Two states:
+  # OAuth pass-through bills against the user's Team-plan seat (flat
+  # seat fee, marginal cost ~zero) and renders cyan. API-key path
+  # bills per-token against the platform's shared Anthropic key at
+  # full API rates and renders red — the visual differentiation is
+  # the whole point. Identity moves to the dim line below where it
+  # belongs (it's context, not the headline).
   if [ -n "$USE_API_KEY" ]; then
     identity=$(gcloud config get-value account 2>/dev/null | head -1 || true)
     [ -n "$identity" ] || identity="(no gcloud account)"
 
     secs_left=$((expires_at_epoch - now))
-    if [ "$secs_left" -le 0 ]; then state_label="expired"
-    elif [ "$secs_left" -ge 3600 ]; then state_label="key $((secs_left / 3600))h left"
-    else state_label="key $((secs_left / 60))m left"
+    if [ "$secs_left" -le 0 ]; then key_label="key expired"
+    elif [ "$secs_left" -ge 3600 ]; then key_label="key $((secs_left / 3600))h left"
+    else key_label="key $((secs_left / 60))m left"
     fi
+
+    mode_color="$C_BOLD_RED"
+    mode_label="API user (high cost)"
+    detail_prefix="as $identity · $key_label"
   else
-    identity="$API_USER"
-    state_label="team-plan"
+    mode_color="$C_BOLD_CYAN"
+    mode_label="oauth passthrough (normal cost)"
+    detail_prefix="as $API_USER"
   fi
 
   last=$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo 0)
@@ -297,9 +310,9 @@ if [ -t 2 ] && ! quiet; then
   fi
 
   gw_host=${GATEWAY_URL#http*://}
-  printf '%s▰ Claude Gateway%s · %s\n' "$C_BOLD_CYAN" "$C_RESET" "$identity" >&2
+  printf '%s▰ Claude Gateway · %s%s\n' "$mode_color" "$mode_label" "$C_RESET" >&2
   printf '%s  %s · wrapper %s (checked %s) · via %s%s\n' \
-    "$C_DIM" "$state_label" "$WRAPPER_VERSION" "$checked" "$gw_host" "$C_RESET" >&2
+    "$C_DIM" "$detail_prefix" "$WRAPPER_VERSION" "$checked" "$gw_host" "$C_RESET" >&2
 fi
 
 # ---- exec the real claude ---------------------------------------------
